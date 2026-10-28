@@ -22,6 +22,10 @@ Documentación oficial en [`references/`](references/):
   operación CGR4/SGR4 V10 (citado como "manual SGR4") y folleto de
   pirgeómetros. El manual SGR4 no incluye mapa de registros.
 
+Notas del proyecto en [`docs/`](docs/): [decisiones técnicas](docs/decisiones-tecnicas.md),
+[arquitectura explicada con C4](docs/arquitectura-c4.md),
+[prueba 01](docs/prueba-01.md) y [plan del dashboard en tiempo real](docs/plan-dashboard.md).
+
 ## 1. Conexión
 
 El PMU485 es a la vez un conversor USB ↔ RS-485 de 2 hilos (chip FTDI, Windows
