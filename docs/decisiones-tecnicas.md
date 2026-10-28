@@ -6,8 +6,10 @@ Cada decisión indica el documento y la sección exacta que la justifica.
 
 | Clave | Documento |
 |---|---|
-| **[MAN]** | `doc/Operational_Manual_SMP10x_SMP22x_Smart_Pyranometers_V20.pdf` (OTT HydroMet, 0374214, 02-0326) |
-| **[DS]** | `doc/KippZonen_Data_sheet_SMPx_2025_online.pdf`, tabla "Technical Specifications" |
+| **[MAN]** | `references/pyranometer-SMP22x/Operational_Manual_SMP10x_SMP22x_Smart_Pyranometers_V20.pdf` (OTT HydroMet, 0374214, 02-0326) |
+| **[DS]** | `references/pyranometer-SMP22x/KippZonen_Data_sheet_SMPx_2025_online.pdf`, tabla "Technical Specifications" |
+| **[SGR]** | `references/pyrgeometer-SGR4/Operational_Manual_CGR4_SGR4_V10.pdf` (manual de operación CGR4/SGR4 V10) |
+| **[SGRDS]** | `references/pyrgeometer-SGR4/110101MEKZWTdsPyrgeometersEN.pdf` (folleto de pirgeómetros Kipp & Zonen) |
 | **[MAN2015]** | Kipp & Zonen, *Instruction Manual SMP series*, 1 ene 2015 (vía Campbell Scientific): <https://s.campbellsci.com/documents/ca/manuals/smp-series_man.pdf> |
 | **[IFACE]** | Kipp & Zonen, *Pyranometer interface options* V1.0, 24 jun 2021: <https://www.kippzonen.com/Download/1084/Interface-options-for-Kipp-Zonen-Pyranometers> |
 | **[PMU]** | Ficha del PMU485, Equinox Instruments: <https://www.equinoxinstruments.co.uk/products/accessories/pmu485>; manual PMU485: <https://www.kippzonen.com/Download/1061/Manual-PMU485-Smart-Setup-Hub> |
@@ -46,18 +48,20 @@ Cada decisión indica el documento y la sección exacta que la justifica.
 
 ## D4. Mapa de registros leídos
 
-Cada ciclo hace una sola transacción FC04 por sensor, de 8 registros, desde el 2 hasta el 9.
+Cada ciclo hace una sola transacción FC04 por sensor: 8 registros (2 a 9) en los piranómetros y 10 registros (2 a 11) en el pirgeómetro.
 
 | Reg. | Nombre | Conversión | Fuente [MAN] |
 |---|---|---|---|
 | 2 | IO_OPERATIONAL_MODE | 1 = normal … 5 = error | §15.2, §15.6 |
 | 3 | IO_STATUS_FLAGS | bits | §15.6 (tabla de bits) |
 | 4 | IO_SCALE_FACTOR | S16 | §15.6 |
-| 5 | IO_SENSOR1_DATA | S16 ÷ escala → W/m² | §15.2, §15.6 |
+| 5 | IO_SENSOR1_DATA | S16 ÷ escala → W/m². En el SGR4, radiación neta | §15.2, §15.6 |
 | 6 | IO_RAW_SENSOR1_DATA | S16 ÷ escala | §15.6 |
 | 7 | IO_STDEV_SENSOR1 | ÷10 → W/m² | §15.6 |
 | 8 | IO_BODY_TEMPERATURE | ÷10 → °C | §15.6 |
 | 9 | IO_EXT_POWER_SENSOR | ÷10 → V | §15.6 |
+| 10 | IO_SENSOR2_DATA | S16 ÷ escala → W/m². Solo SGR: Ld↓ compensado | §15.2, §15.6 (registro 4) |
+| 11 | IO_RAW_SENSOR2_DATA | S16 ÷ escala → W/m². Solo SGR: Ld↓ | §15.2 |
 
 Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (IO_RH e IO_PRESSURE), según [MAN] §15.2 y §15.6.
 
@@ -116,12 +120,13 @@ Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (
 
 ## D10. Presupuesto de tiempo del bus
 
-- **Tiempo de un carácter:** 11 bits (1 de inicio + 8 de datos + 1 de paridad + 1 de parada) a 19200 baud = 0,573 ms ([MAN] §8.1).
+- **Tiempo de un carácter:** 11 bits (1 de inicio + 8 de datos + 1 de paridad + 1 de parada) a 19200 baud = 0,573 ms ([MAN] §8.1). Con paridad `N` son 10 bits, porque el programa abre el puerto siempre con 1 bit de parada.
 - **Formato de las tramas FC04:**
   - Petición de 8 bytes = 4,6 ms.
-  - Respuesta de 5 + 2N bytes; con N = 8 son 21 bytes = 12,0 ms.
+  - Respuesta de 5 + 2N bytes; con N = 8 son 21 bytes = 12,0 ms; con N = 10 (pirgeómetro) son 25 bytes = 14,3 ms.
   - Hay además dos silencios t3.5 ("Modbus over serial line V1.02", documento que cita [MAN] §15.1).
-  - Total en el cable: **20,6 ms** por sensor. Lo comprueba `tests/test_smp22x.py::test_wire_time_19200`.
+  - Total en el cable: **20,6 ms** por piranómetro y **22,9 ms** por pirgeómetro. Lo comprueba `tests/test_smp22x.py::test_wire_time_19200`.
+- **En `run.json`:** el tiempo teórico se calcula con los baudios y la paridad con que se abrió el bus (`bus.baudrate`, `bus.parity`), no con los de fábrica.
 - **Medición en la prueba 01:**
   - Tiempo de ida y vuelta (RTT) medio: 28, 32 y 34 ms.
   - Ciclo completo de 3 sensores: 93 ms de media (p95: 109 ms).
@@ -152,7 +157,8 @@ Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (
   - Ninguno de los dos documentos define los códigos 607 ni 611.
 - **Por qué los datos leídos son válidos:** los registros 2–9 y sus escalas son idénticos en [MAN2015] Apéndice A ("Real-time processed data") y en [MAN] §15.2. Lo único que cambia es el nombre del modelo.
 - **Decisión:** mantener el aviso, pero no bloquear la adquisición. **No se usan los registros 10000+ ni los 16–17 como fuente de datos principal**, porque [MAN2015] Apéndice A asigna los registros 16–17 a IO_DAC_OUTPUT_VOLTAGE e IO_SELECTED_DAC_INPUT. En estos sensores, por tanto, las columnas `rh_pct` y `pressure_hpa` **no deben interpretarse**.
-- **Pendiente:** consultar a OTT HydroMet qué modelo corresponde a los códigos 607 y 611. Hay que dar lote y serie: 240466, 240349 y 240350 ([MAN] §12.1).
+- **Actualización:** el sensor #2 es un pirgeómetro SGR4, no un SMP22x (ver D15). Por eso el programa asocia el código 611 al SGR4 y el 607 al SMP22x (`registers.OBSERVED_DEVICE_TYPES`), y avisa en cada identificación de que esos códigos no están en [MAN].
+- **Pendiente:** confirmar con OTT HydroMet los códigos 607 y 611. Hay que dar lote y serie: 240466, 240349 y 240350 ([MAN] §12.1).
 
 ## D13. Tiempos de estabilización
 
@@ -164,3 +170,22 @@ Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (
 - **Decisión:** guardar los datos en CSV largo (una fila por sensor y ciclo), un CSV con promedios de 1 minuto y un `run.json` con los metadatos.
 - **Fuente:** [MAN] §9.1: "The instrument has no internal data memory". El PC es el único registro de los datos, así que el CSV se vacía a disco en cada ciclo.
 - **Datos incluidos en `run.json`:** [MAN] §12.1 pide, para cualquier soporte técnico, el modelo, el número de serie, archivos de datos de ejemplo y el sistema de adquisición.
+- **Estadísticas de comunicación:** `comm_errors = requests − responses_ok` cuenta solo fallos del sensor (timeout, CRC, excepción Modbus). Una desconexión del USB va aparte, en `port_errors` y `port_downtime_s`, y no cuenta como petición. El ciclo cortado por la desconexión no entra en `cycle_ms_*` ni en la ocupación del bus, y los ciclos que no se hicieron mientras faltaba el puerto no cuentan como `overruns`.
+
+## D15. Sensor #2: pirgeómetro SGR4
+
+- **Hecho:** la dirección 2 es un pirgeómetro Kipp & Zonen SGR4, no un piranómetro. Mide radiación infrarroja (onda larga, 4,5–42 µm) del cielo, no luz solar ([SGR] §5.1, §13.1).
+- **Qué entrega por Modbus.** [SGR] no trae mapa de registros. El mapa común de los sensores smart está en [MAN] §15.2, que marca qué registros cambian en el SGR:
+  - Registro 5, IO_SENSOR1_DATA: "Temperature compensated radiation in W/m2 (**Net radiation for SGR**)".
+  - Registro 10, IO_SENSOR2_DATA: "Temperature compensated long wave down radiation in W/m2 (only for SGR)".
+  - Registro 11, IO_RAW_SENSOR2_DATA: "Long wave down radiation in W/m2 (only for SGR)".
+  - [MAN] §15.6, registro 4: el factor de escala se aplica también a IO_SENSOR2_DATA e IO_RAW_SENSOR2_DATA.
+- **Física:** [SGR] §7.1.5 da Ld = Uemf/S + 5,67·10⁻⁸·Tb⁴. Uemf/S es la radiación neta entre el cielo y el detector y Tb la temperatura del cuerpo en K. La neta "is mostly negative", porque el cielo suele estar más frío que el sensor. [SGRDS] lo resume: "if the sky is colder than the pyrgeometer, … the output is negative".
+- **Esto explica la prueba 01.** El valor "anómalo" de −160 a −163 W/m² del sensor #2 ([prueba 01](prueba-01.md)) era la radiación neta del SGR4, leída del registro 5 como si fuera irradiancia. Es un valor normal para un pirgeómetro con cielo despejado.
+- **Decisión:**
+  - Configurar por dirección qué sensores son pirgeómetros (`--pyrgeometers`, por defecto `2`), en lugar de deducirlo del IO_DEVICE_TYPE, porque el código 611 no está documentado. Si el código y la configuración no cuadran, `read_info` avisa.
+  - En el pirgeómetro, leer los registros 2–11 en una sola transacción y tomar **Ld↓ (registro 10) como magnitud principal**: es la que se promedia por minuto y se grafica. La neta (registro 5) se guarda también.
+  - Mostrar en `info`, en `onda_larga.png` y en `resumen.csv` la verificación Ld↓ − (neta + σT⁴). Debe quedar dentro de ±5 W/m² (`sensor.LW_CHECK_TOLERANCE_WM2`), que cubre la resolución de 1 W/m² con escala 0 y la de 0,1 °C de la temperatura (≈ 0,6 W/m²).
+  - Graficar el pirgeómetro aparte de los piranómetros y sacarlo de la "media de los sensores": mide otra magnitud.
+- **Riesgo pendiente:** el SGR4 de la prueba 01 tiene data model 102 y [MAN] describe el 108. No se ha podido confirmar que los registros 10–11 existan con ese significado en el 102. Si la verificación falla en el hardware, la alternativa es calcular Ld↓ con la fórmula de [SGR] §7.1.5 a partir de la neta y la temperatura, que sí se leen en el bloque 2–9.
+- **Código:** `registers.py` (`IO_SENSOR2_DATA`, `PYRGEOMETER_BLOCK_COUNT`, `OBSERVED_DEVICE_TYPES`), `sensor.py` (`Sample.measurement`, `Sample.lw_down_calc`), `cli.py` (`--pyrgeometers`), `plotting.py` (`_plot_longwave`).

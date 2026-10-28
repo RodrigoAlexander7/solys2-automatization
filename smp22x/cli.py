@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from . import registers as reg
+from .sensor import LW_CHECK_TOLERANCE_WM2
 from .transport import (
     BusError,
     PortError,
@@ -48,30 +49,54 @@ def _add_bus_args(p: argparse.ArgumentParser) -> None:
 def _add_address_arg(p: argparse.ArgumentParser) -> None:
     p.add_argument("--addresses", "-a", type=int, nargs="+", default=[2, 3, 4],
                    help="direcciones Modbus de los sensores (2 3 4)")
+    p.add_argument("--pyrgeometers", type=int, nargs="*", default=[2],
+                   help="cuáles de esas direcciones son pirgeómetros SGR4 (2); "
+                        "sin valores = ninguno")
 
 
-SIMULATED_ADDRESSES = [2, 3, 4]  # la instalación real: tres SMP22x en 2, 3 y 4
+# La instalación real: pirgeómetro SGR4 en la dirección 2 y piranómetros SMP22x en 3 y 4
+SIMULATED_ADDRESSES = [2, 3, 4]
+SIMULATED_PYRGEOMETERS = [2]
 
 
-def _open_bus(args):
+def _open_bus(args, baud: int | None = None, parity: str | None = None):
+    """Abre el bus con los parámetros de args, o con baud/parity si se indican
+    (cmd_scan prueba varias combinaciones sin tocar args)."""
+    baud = args.baud if baud is None else baud
+    parity = args.parity if parity is None else parity
     if args.simulate:
         from .simulator import SimulatedBus
-        return SimulatedBus(SIMULATED_ADDRESSES, baudrate=args.baud, timeout=args.timeout)
+        return SimulatedBus(SIMULATED_ADDRESSES, baudrate=baud, parity=parity,
+                            timeout=args.timeout, pyrgeometers=SIMULATED_PYRGEOMETERS)
     port = autodetect_port() if args.port == "auto" else args.port
-    return SerialBus(port, baudrate=args.baud, parity=args.parity, timeout=args.timeout)
+    return SerialBus(port, baudrate=baud, parity=parity, timeout=args.timeout)
 
 
-def min_cycle_s(n_sensors: int, baudrate: int) -> float:
-    per_read = read_transaction_wire_time_s(reg.FAST_BLOCK_COUNT, baudrate) + OVERHEAD_PER_READ_S
-    return n_sensors * per_read
+def sensor_types(args) -> dict[int, str]:
+    """Tipo de cada dirección según --addresses y --pyrgeometers."""
+    unknown = sorted(set(args.pyrgeometers) - set(args.addresses))
+    if unknown:
+        raise SystemExit(f"--pyrgeometers {unknown} no está en --addresses {args.addresses}")
+    return {
+        a: reg.PYRGEOMETER if a in args.pyrgeometers else reg.PYRANOMETER for a in args.addresses
+    }
 
 
-def check_interval(interval: float, n_sensors: int, baudrate: int) -> None:
-    floor = min_cycle_s(n_sensors, baudrate)
+def min_cycle_s(block_counts: list[int], baudrate: int, parity: str = reg.DEFAULT_PARITY) -> float:
+    """Duración mínima de un ciclo: una lectura por sensor, cada una con su bloque."""
+    return sum(
+        read_transaction_wire_time_s(n, baudrate, parity) + OVERHEAD_PER_READ_S for n in block_counts
+    )
+
+
+def check_interval(
+    interval: float, block_counts: list[int], baudrate: int, parity: str = reg.DEFAULT_PARITY
+) -> None:
+    floor = min_cycle_s(block_counts, baudrate, parity)
     if interval < floor:
         raise SystemExit(
-            f"Intervalo {interval:g} s demasiado corto: leer {n_sensors} sensores a {baudrate} "
-            f"baudios necesita ~{floor * 1000:.0f} ms por ciclo."
+            f"Intervalo {interval:g} s demasiado corto: leer {len(block_counts)} sensores a "
+            f"{baudrate} baudios necesita ~{floor * 1000:.0f} ms por ciclo."
         )
     if interval < 1.0:
         print(
@@ -103,8 +128,7 @@ def cmd_scan(args) -> int:
         combos = [(b, p) for b in (19200, 9600, 38400, 57600, 115200) for p in ("E", "N", "O")]
     found = 0
     for baud, parity in combos:
-        args.baud, args.parity = baud, parity
-        bus = _open_bus(args)
+        bus = _open_bus(args, baud=baud, parity=parity)
         print(f"Buscando en {bus.description}, direcciones {args.first}-{args.last}...")
         try:
             for address in addresses:
@@ -113,23 +137,43 @@ def cmd_scan(args) -> int:
                 except BusError:
                     continue
                 found += 1
-                print(f"  #{address}: {info.model} serie {info.serial_label} "
-                      f"(data model {info.datamodel_version})")
+                kind = reg.DEVICE_SENSOR_TYPES.get(info.device_type)
+                kind_label = f", {reg.SENSOR_LABELS[kind]}" if kind else ""
+                print(f"  #{address}: {info.model}{kind_label} serie {info.serial_label} "
+                      f"(IO_DEVICE_TYPE {info.device_type}, data model {info.datamodel_version})")
         finally:
             bus.close()
     print(f"{found} sensor(es) encontrado(s).")
     return 0 if found else 1
 
 
+def _print_pyrgeometer_check(sample) -> bool:
+    """Imprime Ld↓ leído frente a neta + σT⁴. Devuelve False si no cuadran."""
+    print(f"  radiación neta {sample.irradiance} W/m² (bruta {sample.raw_irradiance}), "
+          f"desv. {sample.stdev} W/m²")
+    print(f"  onda larga descendente Ld↓ {sample.lw_down} W/m² (bruta {sample.raw_lw_down})")
+    calc = sample.lw_down_calc
+    if calc is None or sample.lw_down is None:
+        return True
+    diff = sample.lw_down - calc
+    print(f"  verificación: neta + σT⁴ = {calc:.1f} W/m², diferencia con Ld↓ {diff:+.1f} W/m²")
+    if abs(diff) > LW_CHECK_TOLERANCE_WM2:
+        print(f"  aviso: la diferencia supera {LW_CHECK_TOLERANCE_WM2:g} W/m². Este firmware "
+              "podría no seguir el mapa de registros 10–11 del manual V20.")
+        return False
+    return True
+
+
 def cmd_info(args) -> int:
     from .sensor import SMPSensor
 
+    types = sensor_types(args)
     bus = _open_bus(args)
     print(f"Bus: {bus.description}")
     failures = 0
     try:
         for address in args.addresses:
-            sensor = SMPSensor(bus, address)
+            sensor = SMPSensor(bus, address, types[address])
             try:
                 info = sensor.read_info()
             except BusError as exc:
@@ -137,7 +181,8 @@ def cmd_info(args) -> int:
                 failures += 1
                 continue
             sample = sensor.read_sample(with_diagnostics=True)
-            print(f"\n#{address}: {info.model}  serie {info.serial_label}")
+            print(f"\n#{address}: {info.model} ({reg.SENSOR_LABELS[sensor.sensor_type]})  "
+                  f"serie {info.serial_label}")
             print(f"  data model {info.datamodel_version}, software {info.software_version}, "
                   f"hardware {info.hardware_version}, IO_NODE_ID {info.node_id}")
             for w in info.warnings:
@@ -149,8 +194,12 @@ def cmd_info(args) -> int:
             mode = reg.OPERATIONAL_MODES.get(sample.mode, sample.mode)
             print(f"  modo {mode}, status 0x{sample.status:04X} {sample.status_names or ''}, "
                   f"escala {sample.scale_factor}")
-            print(f"  irradiancia {sample.irradiance} W/m² (bruta {sample.raw_irradiance}), "
-                  f"desv. {sample.stdev} W/m²")
+            if sensor.sensor_type == reg.PYRGEOMETER:
+                if not _print_pyrgeometer_check(sample):
+                    failures += 1
+            else:
+                print(f"  irradiancia {sample.irradiance} W/m² (bruta {sample.raw_irradiance}), "
+                      f"desv. {sample.stdev} W/m²")
             print(f"  T cuerpo {sample.body_temp_c} °C, alimentación {sample.supply_v} V, "
                   f"HR interna {sample.rh_pct} %, presión interna {sample.pressure_hpa} hPa")
             print(f"  tiempo de respuesta {sample.rtt_ms:.1f} ms")
@@ -165,10 +214,16 @@ def cmd_info(args) -> int:
 def cmd_log(args) -> int:
     from .acquisition import Acquisition, AcquisitionConfig
 
-    check_interval(args.interval, len(args.addresses), args.baud)
+    types = sensor_types(args)
+    blocks = [
+        reg.PYRGEOMETER_BLOCK_COUNT if t == reg.PYRGEOMETER else reg.FAST_BLOCK_COUNT
+        for t in types.values()
+    ]
+    check_interval(args.interval, blocks, args.baud, args.parity)
     bus = _open_bus(args)
     cfg = AcquisitionConfig(
         addresses=args.addresses,
+        pyrgeometers=[a for a, t in types.items() if t == reg.PYRGEOMETER],
         interval_s=args.interval,
         duration_s=args.duration,
         diag_every_s=args.diag_every,

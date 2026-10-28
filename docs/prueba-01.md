@@ -33,6 +33,15 @@ Confirma el presupuesto de tiempo de [decisiones-tecnicas.md D10](decisiones-tec
 
 ## Mediciones: el sensor #2 da un valor anómalo
 
+> **Actualización:** el sensor #2 es un **pirgeómetro SGR4**, no un SMP22x. El
+> registro 5 que se leyó como "irradiancia" es, en el SGR4, la **radiación neta
+> de onda larga** (manual V20 §15.2: "Net radiation for SGR"), que es negativa
+> cuando el cielo está más frío que el sensor. Un valor de −160 W/m² es normal
+> con cielo despejado: con el cuerpo a unos 25 °C (σT⁴ ≈ 448 W/m²), equivale a
+> una onda larga descendente Ld↓ ≈ 290 W/m². El análisis de abajo se escribió
+> antes de saberlo y se deja como registro. Ver
+> [D15](decisiones-tecnicas.md#d15-sensor-2-pirgeómetro-sgr4).
+
 | Sensor | Rango observado | Observación |
 |---|---|---|
 | #2 | −160 a −163 W/m² | Negativo y casi constante |
@@ -49,7 +58,10 @@ Confirma el presupuesto de tiempo de [decisiones-tecnicas.md D10](decisiones-tec
 
 ## Próximos pasos
 
-1. Ejecutar `python -m smp22x info -a 2` y revisar la escala, la irradiancia bruta y los flags del sensor #2.
-2. Intercambiar la posición física de #2 con la de #3. Si el valor anómalo sigue a la dirección 2, el problema está en el sensor.
-3. Preguntar a OTT HydroMet a qué modelo corresponden los códigos 607 y 611 (manual V20 §12.1).
-4. Repetir la prueba 30 min con el sol o la lámpara, anotando las condiciones.
+Actualizados tras identificar el SGR4:
+
+1. Ejecutar `python -m smp22x info` y comprobar en el sensor #2 que la verificación "neta + σT⁴" coincide con Ld↓ (diferencia dentro de ±5 W/m²). Confirma que el firmware 102 tiene los registros 10–11.
+2. Preguntar a OTT HydroMet a qué modelo corresponden los códigos 607 y 611 (manual V20 §12.1).
+3. Repetir la prueba 30 min con el sol o la lámpara, anotando las condiciones. Una lámpara también calienta y cambia la lectura del pirgeómetro, así que anotar si estaba encendida.
+
+Pasos originales ya resueltos: revisar la escala de #2 con `info -a 2` e intercambiar físicamente #2 y #3. El valor no era un fallo, era otra magnitud.

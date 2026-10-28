@@ -1,4 +1,5 @@
-"""Lectura e interpretación de un piranómetro SMP10x/SMP22x en el bus."""
+"""Lectura e interpretación de un sensor smart de Kipp & Zonen en el bus:
+piranómetro SMP10x/SMP22x o pirgeómetro SGR4 (mismo mapa de registros, §15.2)."""
 
 from __future__ import annotations
 
@@ -37,9 +38,22 @@ def pressure_to_hpa(raw: int) -> float:
     return raw / 10.0 if raw > 2000 else float(raw)
 
 
+# Diferencia admitida entre Ld↓ leído (IO_SENSOR2_DATA) y Ld↓ calculado como
+# neta + σT⁴. Cubre la resolución de 1 W/m² con escala 0 y la de 0,1 °C de la
+# temperatura (≈ 0,6 W/m²). Si se supera, el firmware probablemente no sigue el
+# mapa de registros 10–11 del manual V20.
+LW_CHECK_TOLERANCE_WM2 = 5.0
+
+
+def blackbody_wm2(temp_c: float) -> float:
+    """Emisión de cuerpo negro del detector, σ·T⁴, a la temperatura del cuerpo."""
+    return reg.STEFAN_BOLTZMANN * (temp_c + 273.15) ** 4
+
+
 @dataclass
 class DeviceInfo:
     address: int
+    sensor_type: str
     device_type: int
     model: str
     datamodel_version: int
@@ -62,11 +76,14 @@ class Sample:
     time_utc: datetime
     ok: bool
     error: str = ""
+    sensor_type: str = reg.PYRANOMETER
     mode: int | None = None
     status: int | None = None
     scale_factor: int | None = None
-    irradiance: float | None = None        # W/m², IO_SENSOR1_DATA
+    irradiance: float | None = None        # W/m², IO_SENSOR1_DATA (neta en el pirgeómetro)
     raw_irradiance: float | None = None    # W/m², IO_RAW_SENSOR1_DATA
+    lw_down: float | None = None           # W/m², IO_SENSOR2_DATA (solo pirgeómetro)
+    raw_lw_down: float | None = None       # W/m², IO_RAW_SENSOR2_DATA (solo pirgeómetro)
     stdev: float | None = None             # W/m², IO_STDEV_SENSOR1
     body_temp_c: float | None = None
     supply_v: float | None = None
@@ -75,10 +92,25 @@ class Sample:
     rtt_ms: float | None = None
 
     @property
+    def measurement(self) -> float | None:
+        """Magnitud principal del sensor: irradiancia global (piranómetro) o Ld↓ (pirgeómetro)."""
+        return self.lw_down if self.sensor_type == reg.PYRGEOMETER else self.irradiance
+
+    @property
+    def lw_down_calc(self) -> float | None:
+        """Ld↓ calculado con la fórmula del manual SGR4 §7.1.5: neta + σT⁴.
+
+        Sirve para comprobar en el hardware que IO_SENSOR2_DATA es realmente Ld↓.
+        """
+        if self.sensor_type != reg.PYRGEOMETER or self.irradiance is None or self.body_temp_c is None:
+            return None
+        return self.irradiance + blackbody_wm2(self.body_temp_c)
+
+    @property
     def valid(self) -> bool:
         return (
             self.ok
-            and self.irradiance is not None
+            and self.measurement is not None
             and self.mode == reg.MODE_NORMAL
             and self.status is not None
             and not (self.status & reg.INVALID_DATA_MASK)
@@ -90,20 +122,34 @@ class Sample:
 
 
 class SMPSensor:
-    def __init__(self, bus: ModbusBus, address: int) -> None:
+    """Un sensor smart en una dirección del bus. Aunque se llama SMPSensor, sirve
+    también para el pirgeómetro SGR4: cambia el bloque leído y la magnitud principal."""
+
+    def __init__(self, bus: ModbusBus, address: int, sensor_type: str = reg.PYRANOMETER) -> None:
         if not 1 <= address <= 247:
             raise ValueError(f"Dirección Modbus fuera de rango: {address}")
+        if sensor_type not in reg.SENSOR_LABELS:
+            raise ValueError(f"Tipo de sensor desconocido: {sensor_type}")
         self.bus = bus
         self.address = address
+        self.sensor_type = sensor_type
+
+    @property
+    def block_count(self) -> int:
+        if self.sensor_type == reg.PYRGEOMETER:
+            return reg.PYRGEOMETER_BLOCK_COUNT
+        return reg.FAST_BLOCK_COUNT
 
     def read_info(self) -> DeviceInfo:
         head = self.bus.read_input_registers(self.address, reg.IO_DEVICE_TYPE, 2)
         ident = self.bus.read_input_registers(self.address, reg.IO_BATCH_NUMBER, 5)
         device_type, datamodel = head
+        model = reg.DEVICE_TYPES.get(device_type) or reg.OBSERVED_DEVICE_TYPES.get(device_type)
         info = DeviceInfo(
             address=self.address,
+            sensor_type=self.sensor_type,
             device_type=device_type,
-            model=reg.DEVICE_TYPES.get(device_type, f"desconocido ({device_type})"),
+            model=model or f"desconocido ({device_type})",
             datamodel_version=datamodel,
             batch_year=ident[0],
             serial_number=ident[1],
@@ -111,8 +157,20 @@ class SMPSensor:
             hardware_version=ident[3],
             node_id=ident[4],
         )
-        if device_type not in reg.DEVICE_TYPES:
-            info.warnings.append(f"IO_DEVICE_TYPE={device_type} no es un SMP10x/SMP22x")
+        if device_type in reg.OBSERVED_DEVICE_TYPES:
+            info.warnings.append(
+                f"IO_DEVICE_TYPE={device_type} no figura en el manual V20; "
+                f"se asume {model} por la prueba 01"
+            )
+        elif device_type not in reg.DEVICE_TYPES:
+            info.warnings.append(f"IO_DEVICE_TYPE={device_type} no es un modelo conocido")
+        expected = reg.DEVICE_SENSOR_TYPES.get(device_type)
+        if expected is not None and expected != self.sensor_type:
+            info.warnings.append(
+                f"el modelo {model} es un {reg.SENSOR_LABELS[expected]}, pero la dirección "
+                f"{self.address} está configurada como {reg.SENSOR_LABELS[self.sensor_type]} "
+                "(revise --pyrgeometers)"
+            )
         if datamodel < reg.MIN_DATAMODEL_VERSION:
             info.warnings.append(
                 f"data model {datamodel} < {reg.MIN_DATAMODEL_VERSION}: el mapa de "
@@ -126,19 +184,23 @@ class SMPSensor:
         t0 = time.perf_counter()
         try:
             regs = self.bus.read_input_registers(
-                self.address, reg.FAST_BLOCK_START, reg.FAST_BLOCK_COUNT
+                self.address, reg.FAST_BLOCK_START, self.block_count
             )
         except BusError as exc:
-            return Sample(self.address, datetime.now(timezone.utc), ok=False, error=str(exc))
+            return Sample(
+                self.address, datetime.now(timezone.utc), ok=False, error=str(exc),
+                sensor_type=self.sensor_type,
+            )
         rtt_ms = (time.perf_counter() - t0) * 1000.0
         now = datetime.now(timezone.utc)
 
-        mode, status, scale_raw, s1, raw1, stdev, body_t, ext_v = regs
+        mode, status, scale_raw, s1, raw1, stdev, body_t, ext_v = regs[:reg.FAST_BLOCK_COUNT]
         scale = to_s16(scale_raw)
         sample = Sample(
             address=self.address,
             time_utc=now,
             ok=True,
+            sensor_type=self.sensor_type,
             mode=mode,
             status=status,
             scale_factor=scale,
@@ -149,6 +211,10 @@ class SMPSensor:
             supply_v=to_s16(ext_v) / 10.0,
             rtt_ms=rtt_ms,
         )
+        if self.sensor_type == reg.PYRGEOMETER:
+            s2, raw2 = regs[reg.FAST_BLOCK_COUNT:]
+            sample.lw_down = scale_sensor_value(s2, scale)
+            sample.raw_lw_down = scale_sensor_value(raw2, scale)
         if sample.irradiance is None:
             sample.error = f"IO_SCALE_FACTOR={scale} no documentado"
 
@@ -158,7 +224,8 @@ class SMPSensor:
                 sample.rh_pct = rh / 10.0
                 sample.pressure_hpa = pressure_to_hpa(pressure)
             except BusError as exc:
-                sample.error = f"diagnóstico: {exc}"
+                # Se añade al error de escala, si lo hay, en vez de taparlo
+                sample.error = "; ".join(filter(None, [sample.error, f"diagnóstico: {exc}"]))
         return sample
 
     def clear_error(self) -> None:

@@ -1,8 +1,9 @@
-# Cómo funciona el lector de piranómetros SMP22x
+# Cómo funciona el lector de radiómetros SMP22x + SGR4
 
 Es un programa de terminal en Python que, cada segundo, le pregunta a tres
-sensores de radiación solar cuánta luz están recibiendo, guarda las respuestas
-en CSV y al final dibuja gráficas. No hay servidor, ni base de datos, ni
+sensores de radiación cuánta energía están recibiendo, guarda las respuestas en
+CSV y al final dibuja gráficas. Dos son piranómetros (luz solar) y uno es un
+pirgeómetro (infrarrojo del cielo). No hay servidor, ni base de datos, ni
 interfaz gráfica.
 
 - [Glosario para devs web](#glosario-para-devs-web)
@@ -10,17 +11,19 @@ interfaz gráfica.
 - [C4 nivel 2 · Contenedores](#c4-nivel-2--contenedores)
 - [C4 nivel 3 · Componentes](#c4-nivel-3--componentes)
 - [Un ciclo de 1 s](#un-ciclo-de-1-s)
-- [Bugs verificados](#bugs-verificados)
+- [Bugs corregidos](#bugs-corregidos)
 
 ## Glosario para devs web
 
 | Término | Qué es aquí | Equivalente web |
 |---|---|---|
-| Piranómetro SMP22x | Sensor de Kipp & Zonen que mide radiación solar en W/m². Hay tres, en las direcciones 2, 3 y 4. | Un pequeño servidor que solo expone datos de lectura. |
+| Piranómetro SMP22x | Sensor de Kipp & Zonen que mide radiación solar (onda corta) en W/m². Hay dos, en las direcciones 3 y 4. | Un pequeño servidor que solo expone datos de lectura. |
+| Pirgeómetro SGR4 | Sensor que mide la radiación infrarroja (onda larga) que emite el cielo, Ld↓, en W/m². Está en la dirección 2. Habla el mismo Modbus que los SMP, pero dos registros significan otra cosa. | Otro servidor con la misma API, pero algunos campos con otro significado. |
+| Radiación neta / Ld↓ | El SGR4 mide la diferencia entre lo que recibe del cielo y lo que él mismo emite (neta, casi siempre negativa). Ld↓ = neta + σT⁴, con T la temperatura del sensor. | Un campo derivado que el servidor ya calcula, y que puedes recalcular para validar. |
 | RS-485 | El cable físico: dos hilos trenzados compartidos por todos los sensores en paralelo. | La red, pero un bus compartido donde solo habla uno a la vez. |
 | Modbus RTU | El protocolo del cable. El PC (maestro) pregunta y el sensor (esclavo) responde. El sensor nunca habla si no le preguntan. | HTTP petición/respuesta. Maestro = cliente, esclavo = servidor. |
 | Dirección (slave id) | Número 1–247 de cada sensor. Todos oyen la petición, solo responde el que tiene esa dirección. | El host o la IP de destino. |
-| Registro | Casilla de 16 bits en la memoria del sensor. El 5 es la irradiancia, el 8 la temperatura. Mapa completo en `registers.py`. | Un campo de un endpoint: `GET /registers/5`. |
+| Registro | Casilla de 16 bits en la memoria del sensor. El 5 es la irradiancia (la neta en el SGR4), el 8 la temperatura, el 10 Ld↓ (solo SGR4). Mapa completo en `registers.py`. | Un campo de un endpoint: `GET /registers/5`. |
 | FC04 / FC05 | "Function code": tipo de operación. FC04 lee varios registros seguidos; FC05 escribe un "coil" (booleano). | El método HTTP. FC04 ≈ GET de un rango, FC05 ≈ POST de un flag. |
 | Coil 10 (IO_CLEAR_ERROR) | El único "botón" que el programa pulsa: borra los flags de error que el sensor enciende siempre al arrancar. | Un `POST /errors/clear` idempotente. |
 | Half-duplex, un maestro | Solo viaja una trama a la vez, así que los sensores se consultan en serie. | Un servidor con un único worker: nada de `Promise.all`. |
@@ -38,8 +41,8 @@ sistemas alrededor.
 ```mermaid
 flowchart LR
   tech(["Investigador / técnico<br/>[Persona]<br/>Lanza pruebas desde la terminal<br/>y revisa CSV y gráficas"])
-  app["smp22x<br/>[Sistema de software]<br/>Lee los 3 piranómetros cada 1 s,<br/>guarda CSV y genera gráficas"]
-  smp["3 piranómetros SMP22x<br/>[Hardware externo]<br/>Direcciones Modbus 2, 3 y 4"]
+  app["smp22x<br/>[Sistema de software]<br/>Lee los 3 radiómetros cada 1 s,<br/>guarda CSV y genera gráficas"]
+  smp["Pirgeómetro SGR4 (dir. 2)<br/>2 piranómetros SMP22x (dir. 3 y 4)<br/>[Hardware externo]"]
   fs[("Disco local: data/<br/>[Almacenamiento]<br/>Una carpeta por prueba")]
   se["SmartExplorer<br/>[Software del fabricante]<br/>Configura los sensores"]
 
@@ -74,14 +77,14 @@ flowchart LR
     direction LR
     cli["App CLI smp22x<br/>[Proceso Python 3]<br/>ports, scan, info, log, plot<br/>minimalmodbus, pyserial,<br/>pandas, matplotlib"]
     drv["Puerto COM virtual<br/>[Driver FTDI del SO]"]
-    run[("Carpeta de prueba<br/>[Archivos]<br/>raw_1s.csv · minute_avg.csv<br/>run.json · *.png · resumen.csv")]
+    run[("Carpeta de prueba<br/>[Archivos]<br/>raw_1s.csv · minute_avg.csv · run.json<br/>irradiancia.png · onda_larga.png<br/>comunicacion.png · resumen.csv")]
   end
   pmu["PMU485 Smart Setup Hub<br/>[Hardware]<br/>USB a RS-485 + fuente 12 V"]
   subgraph bus["Bus RS-485 (2 hilos, en paralelo)"]
     direction TB
-    s2["SMP22x dir. 2"]
-    s3["SMP22x dir. 3"]
-    s4["SMP22x dir. 4"]
+    s2["SGR4 dir. 2<br/>pirgeómetro"]
+    s3["SMP22x dir. 3<br/>piranómetro"]
+    s4["SMP22x dir. 4<br/>piranómetro"]
   end
 
   tech -->|"terminal"| cli
@@ -105,7 +108,7 @@ flowchart LR
 | App CLI smp22x | Un solo proceso que vive mientras dura el comando. Con `log` queda en bucle hasta la duración pedida o Ctrl+C. | Un script de Node que corres con `npx`, sin servidor. |
 | Carpeta de prueba | Cada `log` crea una carpeta nueva. Se hace `flush` en cada ciclo, así que un corte no pierde lo ya leído. | La base de datos, append-only. |
 | Puerto COM + PMU485 | El programa abre `COM10` como si fuera un archivo y escribe bytes. Driver y caja hacen el resto. | El socket TCP y la tarjeta de red. |
-| Los 3 sensores | Responden a Modbus. Actualizan la irradiancia una vez por segundo: leer más rápido no aporta nada. | Tres APIs externas con rate limit físico. |
+| Los 3 sensores | Responden a Modbus. Actualizan la medida una vez por segundo: leer más rápido no aporta nada. El SGR4 además responde lento a los cambios (63 % en < 6 s). | Tres APIs externas con rate limit físico. |
 
 ## C4 nivel 3 · Componentes
 
@@ -118,7 +121,7 @@ flowchart TB
     cli["cli.py<br/>[Router de comandos]<br/>argparse, valida intervalo, abre el bus"]
     acq["acquisition.py<br/>[Bucle de adquisición]<br/>Acquisition · _MinuteAggregator<br/>_SensorState · reintentos y backoff"]
     plot["plotting.py<br/>[Informes]<br/>load_run · plot_run · summarize"]
-    sensor["sensor.py<br/>[Modelo del sensor]<br/>SMPSensor · Sample · DeviceInfo"]
+    sensor["sensor.py<br/>[Modelo del sensor]<br/>SMPSensor (SMP o SGR4) · Sample · DeviceInfo"]
     regs["registers.py<br/>[Mapa de registros]<br/>solo constantes"]
     iface{{"ModbusBus<br/>[Interfaz / Protocol]"}}
     serial["transport.py: SerialBus<br/>[Cliente Modbus real]<br/>BusError · PortError · autodetect"]
@@ -151,13 +154,13 @@ flowchart TB
 
 | Archivo | Responsabilidad | Si fuera una app web |
 |---|---|---|
-| `cli.py` | Lee argumentos, elige el comando, abre el bus (real o simulado) y traduce errores de puerto a un mensaje y código de salida 2. | Router + controllers de Express. |
+| `cli.py` | Lee argumentos, elige el comando, decide qué dirección es pirgeómetro (`--pyrgeometers`), abre el bus (real o simulado) y traduce errores de puerto a un mensaje y código de salida 2. | Router + controllers de Express. |
 | `acquisition.py` | Corazón de `log`: bucle alineado al segundo, una lectura por sensor, CSV, promedios por minuto y estadísticas. | Un worker/cron que hace polling y escribe en la BD. |
-| `sensor.py` | Sabe qué registros pedir y cómo pasar enteros crudos a W/m², °C y V. Decide si una muestra es válida. | Capa de servicio + DTO (`Sample`). |
-| `registers.py` | Copia en código del apéndice 15 del manual. | El archivo OpenAPI / tipos de la API externa. |
+| `sensor.py` | Sabe qué registros pedir según el tipo de sensor (2–9 o 2–11) y cómo pasar enteros crudos a W/m², °C y V. Decide si una muestra es válida y cuál es su magnitud principal (`Sample.measurement`). | Capa de servicio + DTO (`Sample`). |
+| `registers.py` | Copia en código del apéndice 15 del manual V20, incluidos los registros "only for SGR". | El archivo OpenAPI / tipos de la API externa. |
 | `transport.py` | Envía y recibe tramas. Convierte errores de librería en `BusError` (un sensor no contestó) y `PortError` (se perdió el USB). | Cliente HTTP (axios) con interceptores de error. |
-| `simulator.py` | Misma interfaz que el bus real, con tres sensores falsos, retrasos realistas y timeouts aleatorios. | Un mock server tipo MSW. |
-| `plotting.py` | Carga una prueba con pandas, dibuja `irradiancia.png` y `comunicacion.png`, calcula el resumen. | La página de reportes. |
+| `simulator.py` | Misma interfaz que el bus real: un SGR4 y dos SMP22x falsos, retrasos realistas, timeouts aleatorios y solo responden a 19200 8E1. | Un mock server tipo MSW. |
+| `plotting.py` | Carga una prueba con pandas, dibuja `irradiancia.png` (piranómetros), `onda_larga.png` (pirgeómetro) y `comunicacion.png`, calcula el resumen. | La página de reportes. |
 
 > **Idea de diseño clave:** `sensor.py` nunca toca el puerto serie; recibe
 > cualquier objeto que cumpla `ModbusBus`. Así `--simulate` y los tests cambian
@@ -166,32 +169,34 @@ flowchart TB
 
 ## Un ciclo de 1 s
 
-Por sensor, una sola petición FC04 de 8 registros (del 2 al 9). Se repite para
-las direcciones 3 y 4 y el programa duerme hasta el siguiente segundo exacto.
+Por sensor, una sola petición FC04: 10 registros (del 2 al 11) para el
+pirgeómetro de la dirección 2 y 8 registros (del 2 al 9) para los piranómetros
+de las direcciones 3 y 4. Después el programa duerme hasta el siguiente segundo
+exacto.
 
 ```mermaid
 sequenceDiagram
   participant A as Acquisition (bucle)
-  participant S as SMPSensor (dir. 2)
+  participant S as SMPSensor (dir. 2, pirgeómetro)
   participant B as SerialBus
   participant P as PMU485 + RS-485
-  participant D as Piranómetro dir. 2
+  participant D as SGR4 dir. 2
   A->>S: read_sample()
-  S->>B: read_input_registers(slave=2, start=2, count=8)
+  S->>B: read_input_registers(slave=2, start=2, count=10)
   B->>P: trama FC04, 8 bytes
   P->>D: la misma trama por el par trenzado
-  D-->>P: respuesta, 21 bytes (8 registros + CRC)
+  D-->>P: respuesta, 25 bytes (10 registros + CRC)
   P-->>B: bytes por USB
-  B-->>S: [modo, status, escala, irr, irr_bruta, desv, temp, voltios]
-  S-->>A: Sample con valid = sí / no
+  B-->>S: [modo, status, escala, neta, neta_bruta, desv, temp, voltios, Ld, Ld_bruta]
+  S-->>A: Sample con measurement = Ld y valid = sí / no
   A->>A: fila en raw_1s.csv y al agregador del minuto
-  Note over A: igual para las direcciones 3 y 4, luego dormir
+  Note over A: direcciones 3 y 4 con count=8 (irradiancia), luego dormir
 ```
 
 | Situación | Qué hace el código | Dónde |
 |---|---|---|
 | Un sensor no contesta | `BusError` → muestra con `ok=False`, se guarda con el error. Tras 5 fallos seguidos solo se le pregunta cada 10 ciclos. | `sensor.py`, `acquisition._account` |
-| Se desconecta el USB | `PortError` → se corta el ciclo y se reabre el puerto cada 2 s hasta que vuelva o Ctrl+C. | `acquisition._recover_port` |
+| Se desconecta el USB | `PortError` → se corta el ciclo y se reabre el puerto cada 2 s hasta que vuelva o Ctrl+C. Cuenta en `port_errors`, no como error del sensor, y el bucle se vuelve a alinear al reloj. | `acquisition._recover_port`, `_loop` |
 | Flags de arranque (ERROR, POWER_FAILED) | No invalidan la medida. Se borran con el coil 10, máximo una vez cada 30 s por sensor. | `acquisition._clear_error` |
 | Cambia el minuto | Se cierra el minuto anterior: n.º de muestras, media, mín, máx, desviación. `complete=1` si ≥ 80 % válidas. | `_MinuteAggregator` |
 | Cada 60 s | Lee además humedad y presión internas (registros 16–17). | `read_sample(with_diagnostics)` |
@@ -200,63 +205,30 @@ sequenceDiagram
 En la [prueba 01](prueba-01.md) cada ciclo de 3 sensores tardó 93 ms de media
 (bus ocupado un 9 %).
 
-## Bugs verificados
+## Bugs corregidos
 
-Reproducidos con un script aparte usando el simulador, sin tocar el código.
-Ninguno afecta a la medida de irradiancia.
+Los tres bugs reportados se confirmaron con el simulador y luego se
+corrigieron. Ninguno afectaba a la medida. Cada uno tiene un test de regresión
+en `tests/test_smp22x.py` (clase `BugRegressionTests`).
 
-### 6 · `run.json` calcula el tiempo en cable siempre a 19200 baudios — confirmado, menor
+| # | Qué pasaba | Qué se cambió |
+|---|---|---|
+| 6 | `run.json` calculaba el tiempo teórico en cable con `reg.DEFAULT_BAUDRATE`. Con `--baud 9600` guardaba 20,6 ms en vez de 41,2 ms. | `ModbusBus` declara `baudrate` y `parity`. `_write_meta` usa los del bus y el tamaño de bloque de cada sensor: `per_sensor.*.theoretical_wire_ms_per_read` y `bus_timing.theoretical_wire_ms_per_cycle`. |
+| 7 | Un `PortError` (USB desconectado) sumaba `requests` sin respuesta: el sensor de turno mostraba un `comm_error` que no era suyo. Además, el ciclo cortado guardaba en `cycle_ms` los ≥ 2 s de reconexión y los ciclos perdidos contaban como `overruns`. | `requests` se incrementa después de leer, así que un `PortError` no cuenta. El ciclo cortado no entra en `cycle_ms`, el bucle se realinea al reloj sin sumar `overruns` y `run.json` añade `port_downtime_s`. |
+| 8 | `cmd_scan` sobrescribía `args.baud` y `args.parity` en cada combinación ([`cli.py:134`](../smp22x/cli.py) en la versión anterior; el reporte decía `:486`). | `_open_bus(args, baud=..., parity=...)` recibe la combinación como parámetros y `args` no se toca. |
 
-[`acquisition.py:201`](../smp22x/acquisition.py#L201)
+Otros arreglos hechos en el camino:
 
-```python
-wire_ms = read_transaction_wire_time_s(reg.FAST_BLOCK_COUNT, reg.DEFAULT_BAUDRATE) * 1000
-```
-
-`AcquisitionConfig` no guarda los baudios y `ModbusBus` no declara `baudrate`
-(aunque `SerialBus` y `SimulatedBus` sí lo tienen).
-
-- **Prueba:** bus simulado a 9600 → `theoretical_wire_ms_per_read: 20.6`. Lo
-  correcto a 9600 es 41.2 ms.
-- `cli.check_interval` sí usa `args.baud`; solo falla el número guardado. La
-  prueba 01 fue a 19200, así que su `run.json` es correcto.
-
-### 7 · Una desconexión del USB cuenta también como error de comunicación — confirmado, menor
-
-[`acquisition.py:315-320`](../smp22x/acquisition.py#L315)
-
-```python
-st.requests += 1
-try:
-    sample = sensor.read_sample(with_diagnostics=do_diag)
-except PortError as exc:
-    self._recover_port(exc)
-    break          # st.ok no se incrementa
-```
-
-`comm_errors = requests - ok`, así que cada `PortError` suma un error de
-comunicación al sensor de turno además de `port_errors`.
-
-- **Prueba:** un `PortError` al leer el sensor 3 → `requests=4 ok=3
-  comm_errors=1` y `port_errors=1`. La consola muestra "3/4 respuestas".
-- **Relacionado:** ese ciclo se guarda en `cycle_ms` con los ≥ 2 s de
-  reconexión dentro, lo que infla `cycle_ms_max`, el p95 y la ocupación del bus.
-
-### 8 · `cmd_scan` sobrescribe `args.baud` y `args.parity` — confirmado, sin efecto hoy
-
-[`cli.py:134`](../smp22x/cli.py#L134) (el reporte decía `:486`, pero `cli.py`
-tiene 258 líneas)
-
-```python
-for baud, parity in combos:
-    args.baud, args.parity = baud, parity
-    bus = _open_bus(args)
-```
-
-Hoy no rompe nada porque `cmd_scan` termina justo después. Se rompería si algo
-reutiliza `args` tras el scan.
-
-- **Prueba:** `scan --simulate --all-baud` → antes `19200 E`, después `115200 O`.
-- **Hallazgo de paso:** esa ejecución reporta "15 sensores" buscando en una
-  sola dirección: el simulador ignora baudios y paridad, y su descripción
-  siempre dice "8E1". Solo afecta al modo simulado.
+- **El simulador ignoraba baudios y paridad.** `scan --simulate --all-baud`
+  encontraba "15 sensores" en una sola dirección y la descripción siempre decía
+  "8E1". Ahora los sensores simulados solo contestan a 19200 8E1, como los
+  reales de fábrica.
+- **Tiempo de carácter sin paridad.** Con `--parity N` el programa usa 8N1,
+  que son 10 bits por carácter, pero el cálculo usaba siempre 11.
+  `transport.bits_per_char` lo tiene en cuenta.
+- **Un error de diagnóstico tapaba otro.** Si fallaba la lectura de humedad y
+  presión, su mensaje sobrescribía el de un factor de escala no documentado.
+  Ahora se concatenan.
+- **Una lectura fallida perdía el tipo de sensor.** La `Sample` de un timeout
+  salía siempre como piranómetro. Ahora conserva `sensor_type`.
+- Errata en el docstring de `acquisition.py` ("largpoo").

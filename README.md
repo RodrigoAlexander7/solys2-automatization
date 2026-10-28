@@ -1,13 +1,26 @@
-# Adquisición SMP22x por RS-485 / Modbus RTU
+# Adquisición SMP22x + SGR4 por RS-485 / Modbus RTU
 
-Lectura de tres piranómetros **Kipp & Zonen SMP22x** (n.º de producto 0374960),
-direcciones Modbus **2, 3 y 4**, conectados en paralelo a un **PMU485 Smart
-Setup Hub** (0382460) enchufado por USB al PC. El software guarda los datos en
-CSV y genera las gráficas de la prueba.
+Lectura de tres radiómetros smart de **Kipp & Zonen** conectados en paralelo a
+un **PMU485 Smart Setup Hub** (0382460) enchufado por USB al PC:
 
-Documentación oficial en [`doc/`](doc/): hoja de datos SMPx 2025 y manual de
-operación SMP10x/SMP22x V20. Las referencias `§` de este README y del código son
-secciones de ese manual.
+| Dirección Modbus | Sensor | Mide |
+|---|---|---|
+| **2** | Pirgeómetro **SGR4** | Radiación de onda larga descendente Ld↓ (infrarrojo del cielo), W/m² |
+| **3** | Piranómetro **SMP22x** (0374960) | Irradiancia global de onda corta, W/m² |
+| **4** | Piranómetro **SMP22x** (0374960) | Irradiancia global de onda corta, W/m² |
+
+El software guarda los datos en CSV y genera las gráficas de la prueba.
+
+Documentación oficial en [`references/`](references/):
+
+- [`references/pyranometer-SMP22x/`](references/pyranometer-SMP22x/): hoja de
+  datos SMPx 2025 y manual de operación SMP10x/SMP22x V20. Las referencias `§`
+  de este README y del código son secciones de ese manual salvo que se indique
+  otra cosa. Su apéndice 15 es el mapa de registros común a los sensores smart,
+  incluidos los registros "only for SGR".
+- [`references/pyrgeometer-SGR4/`](references/pyrgeometer-SGR4/): manual de
+  operación CGR4/SGR4 V10 (citado como "manual SGR4") y folleto de
+  pirgeómetros. El manual SGR4 no incluye mapa de registros.
 
 ## 1. Conexión
 
@@ -16,7 +29,9 @@ lo reconoce como `USB Serial Port (COMx)`) y una fuente de 12 V alimentada por
 el USB. Puede alimentar y comunicar hasta 10 radiómetros en paralelo:
 50 mA para el primero + 10 mA por cada sensor adicional [1][2].
 
-| Hilo del SMP | Función (§7.3.5)          | Borne del PMU485       |
+El SMP22x y el SGR4 usan el mismo código de colores (§7.3.5; manual SGR4 §7.2.2.5):
+
+| Hilo         | Función                   | Borne del PMU485       |
 |--------------|---------------------------|------------------------|
 | Blanco       | Alimentación 5–30 V DC    | +12 V                  |
 | Negro        | Tierra de alimentación    | GND                    |
@@ -30,7 +45,9 @@ el USB. Puede alimentar y comunicar hasta 10 radiómetros en paralelo:
   sensor responde, intercambie amarillo y gris; hacerlo no daña nada.
 - Los tres sensores deben tener **la misma velocidad y paridad** y
   **direcciones distintas** (§11.1). Fábrica: 19200 baud, 8 bits, paridad par,
-  1 bit de parada (§8.1).
+  1 bit de parada (§8.1; manual SGR4 §8.1). El SGR4 sale de fábrica con la
+  dirección 1, así que hay que cambiarla a 2 con SmartExplorer antes de
+  conectarlo al bus.
 - Con cables largos, ponga una resistencia de 120–150 Ω entre A y B en el
   último sensor del bus (§7.3.5). Con cables de 10 m a 19200 baud normalmente
   no hace falta.
@@ -57,16 +74,27 @@ que es el valor por defecto, el programa lo elige solo.
 ```bash
 .venv\Scripts\python -m smp22x scan
 ```
-Busca sensores en las direcciones 1–20 a 19200 8E1. Con `--all-baud` prueba
-además otras velocidades y paridades.
+Busca sensores en las direcciones 1–20 a 19200 8E1 e indica el modelo y si es
+piranómetro o pirgeómetro. Con `--all-baud` prueba además otras velocidades y
+paridades.
 
 ```bash
 .venv\Scripts\python -m smp22x info --clear
 ```
 Muestra, para cada sensor, el modelo, el número de serie, el modo, los flags de
-estado, la irradiancia, la temperatura, la tensión de alimentación, la humedad y
-la presión internas y el tiempo de respuesta. `--clear` borra los flags que el
+estado, la medida, la temperatura, la tensión de alimentación, la humedad y la
+presión internas y el tiempo de respuesta. `--clear` borra los flags que el
 sensor activa siempre al arrancar (§15.8).
+
+En el pirgeómetro muestra la radiación neta, Ld↓ y una **verificación**: Ld↓
+calculado como neta + σT⁴ (manual SGR4 §7.1.5) frente a Ld↓ leído. Si difieren
+más de 5 W/m², avisa y termina con código 1: el firmware no sigue el mapa de
+registros esperado (ver D15 en [decisiones técnicas](docs/decisiones-tecnicas.md)).
+
+**Qué dirección es el pirgeómetro.** Por defecto, la 2. Se cambia con
+`--pyrgeometers` en `info` y `log`: `--pyrgeometers 5` si estuviera en la 5, o
+`--pyrgeometers` sin valores si no hay ninguno. Si el modelo que reporta el
+sensor no coincide con lo configurado, el programa avisa.
 
 ```bash
 .venv\Scripts\python -m smp22x log -d 30m --label prueba1
@@ -79,8 +107,9 @@ Ctrl+C) y al terminar genera las gráficas.
 ```
 Vuelve a generar las gráficas de una prueba ya guardada.
 
-Añadiendo `--simulate` a `scan`, `info` o `log` se usan tres sensores simulados
-en las direcciones 2, 3 y 4, sin hardware. Sirve para probar el programa. Las
+Añadiendo `--simulate` a `scan`, `info` o `log` se usan sensores simulados sin
+hardware: un SGR4 en la dirección 2 y dos SMP22x en la 3 y la 4. Solo responden
+a 19200 8E1, como los reales de fábrica. Sirve para probar el programa. Las
 carpetas simuladas terminan en `_SIM` y las gráficas lo indican.
 
 Tests: `.venv\Scripts\python -m unittest discover -s tests`
@@ -97,6 +126,10 @@ por defecto (`--interval 1`).
 | Recomendación del fabricante | "muestrear cada segundo y guardar promedios de un minuto" | Manual V20 §9.2 |
 | Valor por defecto del software del fabricante | 1 lectura por segundo | Manual SMP (anterior), §4.1 [5] |
 | IEC 61724-1, Clase A | muestreo ≤ 3 s, registro ≤ 1 min | [6] |
+| Tiempo de respuesta del SGR4 | 63 % < 6 s · 95 % < 18 s | Manual SGR4 §13.1 |
+
+El pirgeómetro es mucho más lento que los piranómetros, así que leerlo cada 1 s
+le sobra. Se lee en el mismo ciclo para que todas las filas compartan instante.
 
 - **Menos de 1 s no aporta información.** El registro solo cambia una vez por
   segundo, así que se leerían valores repetidos y se ocuparía el bus para nada.
@@ -111,15 +144,19 @@ por defecto (`--interval 1`).
 
 ### Carga del bus a 19200 baud 8E1 (11 bits por carácter = 0,573 ms)
 
-Cada ciclo hace una lectura FC04 de 8 registros (2–9) por sensor:
+Cada ciclo hace una lectura FC04 por sensor: 8 registros (2–9) en los
+piranómetros y 10 registros (2–11) en el pirgeómetro, que añade Ld↓:
 
-| Parte | Bytes | Tiempo |
+| Parte | Piranómetro | Pirgeómetro |
 |---|---|---|
-| Petición | 8 | 4,6 ms |
-| Respuesta (8 registros) | 21 | 12,0 ms |
-| 2 silencios t3.5 | – | 4,0 ms |
-| **Total en el cable** | | **20,6 ms** |
-| + latencia USB del FTDI (16 ms por defecto) + tiempo de respuesta del sensor | | ≈ 10–30 ms |
+| Petición (8 bytes) | 4,6 ms | 4,6 ms |
+| Respuesta (5 + 2N bytes) | 21 B = 12,0 ms | 25 B = 14,3 ms |
+| 2 silencios t3.5 | 4,0 ms | 4,0 ms |
+| **Total en el cable** | **20,6 ms** | **22,9 ms** |
+| + latencia USB del FTDI (16 ms por defecto) + tiempo de respuesta del sensor | ≈ 10–30 ms | ≈ 10–30 ms |
+
+Con paridad `N` el carácter ocupa 10 bits en lugar de 11, porque el programa
+usa siempre 1 bit de parada.
 
 Con tres sensores, cada ciclo ocupa unos 60–150 ms. Leyendo cada segundo, el bus
 queda ocupado un 6–15 %, así que hay margen de sobra: aunque un sensor no
@@ -135,7 +172,11 @@ Por qué el ciclo es robusto:
   tiene exactamente 60 muestras.
 - Si un sensor falla 5 veces seguidas, solo se le vuelve a consultar cada 10
   ciclos. Así no se retrasa a los demás.
-- Si se desconecta el USB, el programa intenta reabrir el puerto cada 2 s.
+- Si se desconecta el USB, el programa intenta reabrir el puerto cada 2 s. Esa
+  desconexión cuenta en `port_errors` y `port_downtime_s` de `run.json`, no
+  como error de comunicación de ningún sensor. El ciclo cortado y los que no se
+  hicieron mientras faltaba el puerto tampoco entran en las estadísticas de
+  ciclo ni en `overruns`.
 
 ### Tiempos de estabilización
 
@@ -152,30 +193,49 @@ Por cada prueba se crea `data/<fecha>_<hora>[_etiqueta]/` con:
   - `time_utc` y `time_local`: marca de tiempo.
   - `cycle`: número de ciclo. Las filas del mismo ciclo corresponden al mismo instante.
   - `address`: dirección del sensor.
-  - `irradiance_wm2`: `IO_SENSOR1_DATA`, irradiancia compensada en temperatura.
+  - `sensor_type`: `pyranometer` o `pyrgeometer`.
+  - `irradiance_wm2`: `IO_SENSOR1_DATA`. En los piranómetros es la irradiancia
+    global compensada en temperatura. **En el pirgeómetro es la radiación neta
+    del detector**, normalmente negativa (§15.2).
   - `raw_irradiance_wm2`: `IO_RAW_SENSOR1_DATA`.
+  - `lw_down_wm2` y `raw_lw_down_wm2`: solo pirgeómetro. `IO_SENSOR2_DATA` e
+    `IO_RAW_SENSOR2_DATA`, radiación de onda larga descendente Ld↓.
   - `stdev_wm2`, `body_temp_c`, `supply_v`.
   - `rh_pct` y `pressure_hpa`: solo cada 60 s.
   - `mode`, `status_hex`, `status_flags`.
   - `valid`: 1 si el dato es utilizable.
   - `rtt_ms`: tiempo de respuesta de la lectura.
   - `error`: descripción del fallo, si lo hubo.
-- **`minute_avg.csv`**: por minuto y sensor, número de muestras, número de
-  válidas, media, mínimo, máximo y desviación típica. `complete=1` si hay al
-  menos un 80 % de muestras válidas.
+- **`minute_avg.csv`**: por minuto y sensor, tipo de sensor, número de
+  muestras, número de válidas, media, mínimo, máximo y desviación típica de la
+  **magnitud principal**: irradiancia global en los piranómetros y Ld↓ en el
+  pirgeómetro. `net_mean_wm2` es la media de la radiación neta (solo
+  pirgeómetro). `complete=1` si hay al menos un 80 % de muestras válidas.
 - **`run.json`**: configuración, identificación de cada sensor (modelo, número
-  de serie, firmware) y estadísticas del bus.
-- **`irradiancia.png`**: tres paneles con la irradiancia a 1 s (puntos = media de
-  1 min), la diferencia de cada sensor respecto a la media de los tres y la
+  de serie, firmware) y estadísticas del bus. El tiempo teórico en el cable se
+  calcula con los baudios y la paridad reales del bus, por sensor
+  (`per_sensor.*.theoretical_wire_ms_per_read`) y por ciclo
+  (`bus_timing.theoretical_wire_ms_per_cycle`).
+- **`irradiancia.png`**: solo piranómetros. Tres paneles con la irradiancia a
+  1 s (puntos = media de 1 min), la diferencia de cada piranómetro respecto a la
+  media de los piranómetros y la temperatura interna.
+- **`onda_larga.png`**: solo pirgeómetro. Ld↓ a 1 s con la verificación
+  neta + σT⁴ en línea discontinua (deben superponerse), la radiación neta y la
   temperatura interna.
 - **`comunicacion.png`**: tiempo de respuesta por lectura, timeouts y tensión de
-  alimentación.
+  alimentación de todos los sensores.
 - **`resumen.csv`**: estadísticas por sensor. También se imprime en consola.
+  En el pirgeómetro incluye `neta_media_Wm2` y `Ld_menos_calc_Wm2` (media de
+  Ld↓ leído menos neta + σT⁴, debería estar cerca de 0).
+
+Las pruebas guardadas antes de este cambio no tienen `sensor_type`: `plot` las
+trata como si todos los sensores fueran piranómetros, que es como se leyeron.
 
 ### Cuándo una muestra cuenta como válida (`valid = 1`)
 
-Una muestra es válida si el sensor respondió, está en modo normal (1) y no tiene
-activo ninguno de estos flags: `VOID_DATA`, `OVERFLOW`, `UNDERFLOW`,
+Una muestra es válida si el sensor respondió, trae su magnitud principal
+(irradiancia o Ld↓), está en modo normal (1) y no tiene activo ninguno de estos
+flags: `VOID_DATA`, `OVERFLOW`, `UNDERFLOW`,
 `ADC_ERROR`, `CALIBRATION_ERROR` ni `BODY_TEMP_ERROR` (§15.6).
 
 - `ERROR` y `POWER_FAILED` se activan **siempre** al arrancar el sensor (§15.8).
@@ -187,9 +247,15 @@ activo ninguno de estos flags: `VOID_DATA`, `OVERFLOW`, `UNDERFLOW`,
 
 ## 6. Limitaciones y puntos a verificar con el hardware
 
-- Por ahora el software se ha probado con el simulador y con tests unitarios,
-  **no contra los sensores reales**. La primera prueba con hardware debería ser
-  `ports` → `scan` → `info`.
+- La [prueba 01](docs/prueba-01.md) se hizo con hardware real antes de saber
+  que la dirección 2 es un pirgeómetro. El soporte del SGR4 solo se ha probado
+  con el simulador y con tests unitarios. La siguiente prueba con hardware
+  debería ser `ports` → `scan` → `info`, y comprobar en `info` que la
+  verificación del pirgeómetro (neta + σT⁴ frente a Ld↓) cuadra.
+- El SGR4 de la prueba 01 tiene data model 102 y el manual V20 describe el
+  108. Los registros 10–11 (Ld↓) están documentados en V20, pero no se ha
+  podido confirmar que existan con ese significado en el data model 102. La
+  verificación de `info` sirve justo para eso.
 - Unidad de `IO_PRESSURE`: el manual dice "hPa" en §15.2 y "0,1 hPa" en §15.6.
   El programa decide según la magnitud del valor (ver `sensor.pressure_to_hpa`).
   Compruebe que `info` muestra un valor razonable, alrededor de 1000 hPa.

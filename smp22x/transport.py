@@ -19,9 +19,6 @@ from . import registers as reg
 
 FTDI_VID = 0x0403
 
-# Tiempo de un carácter en la línea: 1 start + 8 datos + 1 paridad + 1 stop = 11 bits
-BITS_PER_CHAR = 11
-
 
 class BusError(Exception):
     """Fallo Modbus de una transacción concreta (sin respuesta, CRC, excepción)."""
@@ -33,6 +30,8 @@ class PortError(Exception):
 
 class ModbusBus(Protocol):
     description: str
+    baudrate: int
+    parity: str
 
     def read_input_registers(self, slave: int, start: int, count: int) -> list[int]: ...
 
@@ -75,18 +74,33 @@ def autodetect_port() -> str:
     raise PortError(f"Hay varios puertos COM; indique uno con --port. Encontrados: {listing}")
 
 
-def frame_time_s(n_bytes: int, baudrate: int) -> float:
-    return n_bytes * BITS_PER_CHAR / baudrate
+def bits_per_char(parity: str = reg.DEFAULT_PARITY) -> int:
+    """Bits de un carácter en la línea: 1 start + 8 datos + paridad (0 o 1) + 1 stop.
+
+    SerialBus abre el puerto siempre con 1 bit de parada, así que sin paridad
+    son 10 bits y no 11.
+    """
+    return 10 if parity == "N" else 11
 
 
-def read_transaction_wire_time_s(n_registers: int, baudrate: int) -> float:
+def frame_time_s(n_bytes: int, baudrate: int, parity: str = reg.DEFAULT_PARITY) -> float:
+    return n_bytes * bits_per_char(parity) / baudrate
+
+
+def read_transaction_wire_time_s(
+    n_registers: int, baudrate: int, parity: str = reg.DEFAULT_PARITY
+) -> float:
     """Tiempo mínimo en el cable de una lectura FC04: petición + respuesta + 2 silencios t3.5.
 
     Petición: dirección + función + inicio(2) + cantidad(2) + CRC(2) = 8 bytes.
     Respuesta: dirección + función + nº bytes + 2*N + CRC(2) = 5 + 2N bytes.
     """
-    silent = max(3.5 * BITS_PER_CHAR / baudrate, 0.00175)
-    return frame_time_s(8, baudrate) + frame_time_s(5 + 2 * n_registers, baudrate) + 2 * silent
+    silent = max(3.5 * bits_per_char(parity) / baudrate, 0.00175)
+    return (
+        frame_time_s(8, baudrate, parity)
+        + frame_time_s(5 + 2 * n_registers, baudrate, parity)
+        + 2 * silent
+    )
 
 
 class SerialBus:
