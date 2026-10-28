@@ -1,0 +1,166 @@
+# Decisiones técnicas
+
+Cada decisión indica el documento y la sección exacta que la justifica.
+
+**Documentos citados**
+
+| Clave | Documento |
+|---|---|
+| **[MAN]** | `doc/Operational_Manual_SMP10x_SMP22x_Smart_Pyranometers_V20.pdf` (OTT HydroMet, 0374214, 02-0326) |
+| **[DS]** | `doc/KippZonen_Data_sheet_SMPx_2025_online.pdf`, tabla "Technical Specifications" |
+| **[MAN2015]** | Kipp & Zonen, *Instruction Manual SMP series*, 1 ene 2015 (vía Campbell Scientific): <https://s.campbellsci.com/documents/ca/manuals/smp-series_man.pdf> |
+| **[IFACE]** | Kipp & Zonen, *Pyranometer interface options* V1.0, 24 jun 2021: <https://www.kippzonen.com/Download/1084/Interface-options-for-Kipp-Zonen-Pyranometers> |
+| **[PMU]** | Ficha del PMU485, Equinox Instruments: <https://www.equinoxinstruments.co.uk/products/accessories/pmu485>; manual PMU485: <https://www.kippzonen.com/Download/1061/Manual-PMU485-Smart-Setup-Hub> |
+| **[KIN]** | Kintech, *Kipp & Zonen SMP10 output RS485*: <https://www.kintech-engineering.com/pdf_docs/EN_Pyranometer_Kipp_AND_Zonen_RS485_output.pdf> |
+| **[IEC]** | IEC 61724-1:2021, requisitos de muestreo y registro (resumen): <https://www.linkedin.com/pulse/part-1-2-weather-data-acquisition-according-iec-61724-1-thomas-boldt> |
+
+---
+
+## D1. Protocolo: Modbus RTU sobre RS-485 de 2 hilos
+
+- **Decisión:** usar Modbus RTU sobre RS-485 de 2 hilos. El código usa solo la función 0x04 (leer input registers) y la 0x05 (escribir un coil).
+- **Fuente:**
+  - [MAN] §5.1: "2-wire smart interface with RS-485 Modbus® (RTU) protocol".
+  - [MAN] §15.1, tabla de funciones: 0x01–0x06 y 0x10.
+- **Código:** `registers.py` (`FC_READ_INPUT_REGISTERS`, `FC_WRITE_SINGLE_COIL`).
+
+## D2. Parámetros serie: 19200 baud, 8 bits, paridad par, 1 bit de parada
+
+- **Decisión:** usar por defecto los parámetros de fábrica. Se pueden cambiar con `--baud` y `--parity`.
+- **Fuente:**
+  - [MAN] §8.1 "Instrument set-up", lista de parámetros de comunicación de fábrica.
+  - [MAN] §11.1: todas las direcciones deben ser únicas.
+- **Código:** `registers.py` (`DEFAULT_*`), `cli.py` (`_add_bus_args`).
+
+## D3. Conversor PMU485 y cableado
+
+- **Decisión:** el PMU485 hace de conversor USB–RS-485 (chip FTDI) y de fuente de 12 V. El programa detecta el puerto buscando el identificador de fabricante (VID) de FTDI, 0x0403.
+- **Fuente:**
+  - [MAN] §2.2: el PMU485 (0382460) figura como accesorio.
+  - [MAN] §7.3.5, figura "Connection to RS-485 converter": amarillo y gris = Modbus RS-485, azul = común, blanco = alimentación de 5 a 30 V DC, negro = tierra.
+  - [PMU]: 12 V DC; 50 mA más 10 mA por cada sensor adicional; hasta 10 radiómetros en paralelo; pensado como "installation or service tool".
+- **Polaridad de los hilos de datos:** [MAN] no dice cuál es + y cuál es −. [KIN] (tabla de pines) indica amarillo = Data+ y gris = Data−.
+- **Aislamiento:** [MAN] §7.3.5, NOTICE: el conversor debe tener aislamiento galvánico.
+- **Terminación:** [MAN] §7.3.5 recomienda una terminación de 120–150 Ω en el último dispositivo del bus.
+- **Código:** `transport.py` (`autodetect_port`, `SerialBus`).
+
+## D4. Mapa de registros leídos
+
+Cada ciclo hace una sola transacción FC04 por sensor, de 8 registros, desde el 2 hasta el 9.
+
+| Reg. | Nombre | Conversión | Fuente [MAN] |
+|---|---|---|---|
+| 2 | IO_OPERATIONAL_MODE | 1 = normal … 5 = error | §15.2, §15.6 |
+| 3 | IO_STATUS_FLAGS | bits | §15.6 (tabla de bits) |
+| 4 | IO_SCALE_FACTOR | S16 | §15.6 |
+| 5 | IO_SENSOR1_DATA | S16 ÷ escala → W/m² | §15.2, §15.6 |
+| 6 | IO_RAW_SENSOR1_DATA | S16 ÷ escala | §15.6 |
+| 7 | IO_STDEV_SENSOR1 | ÷10 → W/m² | §15.6 |
+| 8 | IO_BODY_TEMPERATURE | ÷10 → °C | §15.6 |
+| 9 | IO_EXT_POWER_SENSOR | ÷10 → V | §15.6 |
+
+Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (IO_RH e IO_PRESSURE), según [MAN] §15.2 y §15.6.
+
+- **Por qué el bloque 2–9:** es el mismo bloque que lee el programa de ejemplo en C ([MAN] §15.11, `SendModbusRequest (0x04, 2, IO_OPERATIONAL_MODE, 4)`), ampliado hasta el registro 9. Así basta una transacción por sensor.
+- **Por qué no los registros flotantes 10000+:** existen ([MAN] §15.2, "Real time floating data points"), pero el manual no indica el orden de las palabras de 16 bits dentro de cada valor F32. Además, [MAN2015] Apéndice A no los incluye, así que un sensor con firmware antiguo podría no tenerlos. Ver D12.
+- **Identificación del sensor:** se leen los registros 0–1 y 41–45 ([MAN] §15.2, §15.10). El número de serie único es lote + número de serie ([MAN] §15.10).
+- **Código:** `registers.py`, `sensor.py`.
+
+## D5. Aplicación del factor de escala
+
+- **Decisión:** aplicar el factor con una tabla: 2 → ÷100, 1 → ÷10, 0 → ×1, −1 → ×10. Un valor que no esté en la tabla se marca como error.
+- **Fuente:** [MAN] §15.6, registro 4, tabla "Scale factor / Calculation".
+- **Nota:** el `switch` de [MAN] §15.11 no tiene ningún `break`. Tal como está escrito, siempre acaba en `default: fSensorData = 0.0`, por eso no se copió.
+- **Código:** `sensor.scale_sensor_value`.
+
+## D6. Unidad de IO_PRESSURE
+
+- **Decisión:** si el valor bruto es mayor que 2000, se interpreta en 0,1 hPa. Si no, en hPa.
+- **Fuente de la ambigüedad:** [MAN] §15.2 dice "Internal pressure of the sensor in hPa". [MAN] §15.6 (registro 17) dice "in 0.1 hPa" y da la fórmula ÷10.
+- **Código:** `sensor.pressure_to_hpa`.
+
+## D7. Criterio de validez de una muestra
+
+- **Decisión:** una muestra es válida si el sensor responde, está en modo 1 (normal) y no tiene activo ninguno de los bits 0 (VOID), 1 (OVERFLOW), 2 (UNDERFLOW), 4 (ADC), 6 (CALIBRATION) ni 12 (BODY_TEMP).
+- **Fuente:**
+  - [MAN] §15.6: tabla de bits de IO_STATUS_FLAGS y modos de IO_OPERATIONAL_MODE ("When the error mode (5) is set, then there is a fatal error").
+  - [MAN] §15.8: IO_VOID_DATA_FLAG ("data … is not valid") y OVERFLOW/UNDERFLOW.
+- **Por qué los bits 3 (ERROR) y 8 (POWER_FAILED) no invalidan la muestra:** según [MAN] §15.8 (IO_ERROR_FLAG), "The error flag is always set after a power up … The computer should raise the IO_CLEAR_ERROR". Es decir, se activan en cada arranque y no indican un dato malo.
+- **Por qué el bit 11 (desecante) no invalida la muestra:** es un aviso de mantenimiento ([MAN] §15.6). Además, [MAN] §10.1 indica cambiar el desecante cada 10 años.
+- **Código:** `registers.INVALID_DATA_MASK`, `Sample.valid`.
+
+## D8. Borrado de errores con el coil 10 (IO_CLEAR_ERROR)
+
+- **Decisión:** al iniciar, y como mucho una vez cada 30 s si reaparecen los bits 3, 4, 5 u 8, escribir `true` en el coil 10.
+- **Fuente:**
+  - [MAN] §15.9, coil 10: "Setting this coil will clear the error only when the error is a non-fatal error".
+  - [MAN] §15.11: el programa de ejemplo lo escribe cuando `uStatusFlags != 0`.
+  - [MAN] §15.5, nota "i": los valores por defecto se restauran al encender. Escribir el coil no cambia la configuración guardada.
+- **Código:** `SMPSensor.clear_error`, `Acquisition._clear_error`.
+
+## D9. Frecuencia de muestreo: 1 s, con promedios de 1 min
+
+- **Decisión:** leer cada 1 s y guardar también promedios de 1 minuto. El programa rechaza un intervalo más corto que el tiempo que tarda un ciclo, avisa si el intervalo es menor de 1 s y avisa si es mayor de 3 s.
+
+| Argumento | Fuente exacta |
+|---|---|
+| "An optimal setting for the data interval is to sample every second and store one minute averages" | [MAN] §9.2 "Collecting data" |
+| El registro de irradiancia "is updated once per second" | [IFACE], p. 1 |
+| Por defecto, el software del fabricante lee una vez por segundo ("1 poll per second is the default setting") | [MAN2015] §4.1 "Set up communication", paso 4 |
+| Tiempo de respuesta: 63 % en menos de 0,7 s y 95 % en menos de 2 s | [DS] "Response time (63 %)" y "(95 %)"; [MAN] §14.1 |
+| El programa de ejemplo espera 1 s entre lecturas (`Delay (1000)`) | [MAN] §15.11 |
+| IEC 61724-1 Clase A pide muestrear cada 3 s o menos y registrar cada 1 min o menos | [IEC] |
+
+- **Efecto sobre IO_STDEV_SENSOR1:** su valor depende de cada cuánto se lee. [MAN] §15.6, registro 7: "If the poll frequency is quite high (for example 1 poll per second) then the standard deviation will be zero or almost zero". Por eso la variabilidad real se calcula en `minute_avg.csv` (columna `std_wm2`).
+- **Código:** `cli.check_interval`, `acquisition._MinuteAggregator`.
+
+## D10. Presupuesto de tiempo del bus
+
+- **Tiempo de un carácter:** 11 bits (1 de inicio + 8 de datos + 1 de paridad + 1 de parada) a 19200 baud = 0,573 ms ([MAN] §8.1).
+- **Formato de las tramas FC04:**
+  - Petición de 8 bytes = 4,6 ms.
+  - Respuesta de 5 + 2N bytes; con N = 8 son 21 bytes = 12,0 ms.
+  - Hay además dos silencios t3.5 ("Modbus over serial line V1.02", documento que cita [MAN] §15.1).
+  - Total en el cable: **20,6 ms** por sensor. Lo comprueba `tests/test_smp22x.py::test_wire_time_19200`.
+- **Medición en la prueba 01:**
+  - Tiempo de ida y vuelta (RTT) medio: 28, 32 y 34 ms.
+  - Ciclo completo de 3 sensores: 93 ms de media (p95: 109 ms).
+  - Ocupación del bus: **~9 %** leyendo cada 1 s.
+  - Ciclos perdidos: 0.
+- **Consecuencia:** leer cada 1 s deja más de un 90 % del tiempo libre. Un timeout de 0,3 s en un sensor sigue cabiendo dentro del ciclo.
+- **Código:** `transport.read_transaction_wire_time_s`.
+
+## D11. Un solo maestro y peticiones en serie
+
+- **Decisión:** un único proceso lee los tres sensores, uno detrás de otro, sin hilos concurrentes. Un sensor que falla 5 veces seguidas solo se reintenta cada 10 ciclos.
+- **Fuente:**
+  - [MAN] §7.3.5, figura "Connection to a RS-485 network": un maestro y varios esclavos.
+  - [MAN2015] §4 (introducción): el software "is not intended for continuous long-term measurement".
+- **Consecuencia:** no se debe abrir SmartExplorer a la vez que el programa. Usarían el mismo puerto COM y habría dos maestros en el bus.
+
+## D12. Compatibilidad con el firmware detectado en la prueba 01
+
+| Sensor | IO_DEVICE_TYPE | Data model | Software |
+|---|---|---|---|
+| #2 | 611 | 102 | 300 |
+| #3 | 607 | 100 | 201 |
+| #4 | 607 | 100 | 201 |
+
+- **Qué dicen los manuales:**
+  - [MAN] §15.6 (registro 0) solo documenta los códigos 635 (SMP10x) y 636 (SMP22x). En el registro 1 exige un data model ≥ 108.
+  - [MAN2015] Apéndice A (registros 0 y 1) es válido para los data models 100 y 101. Solo lista los códigos 601 (CMP 3) y 603 (CMP 11).
+  - Ninguno de los dos documentos define los códigos 607 ni 611.
+- **Por qué los datos leídos son válidos:** los registros 2–9 y sus escalas son idénticos en [MAN2015] Apéndice A ("Real-time processed data") y en [MAN] §15.2. Lo único que cambia es el nombre del modelo.
+- **Decisión:** mantener el aviso, pero no bloquear la adquisición. **No se usan los registros 10000+ ni los 16–17 como fuente de datos principal**, porque [MAN2015] Apéndice A asigna los registros 16–17 a IO_DAC_OUTPUT_VOLTAGE e IO_SELECTED_DAC_INPUT. En estos sensores, por tanto, las columnas `rh_pct` y `pressure_hpa` **no deben interpretarse**.
+- **Pendiente:** consultar a OTT HydroMet qué modelo corresponde a los códigos 607 y 611. Hay que dar lote y serie: 240466, 240349 y 240350 ([MAN] §12.1).
+
+## D13. Tiempos de estabilización
+
+- Tras encenderse, el sensor puede tardar hasta 3 h en estabilizar su temperatura ([MAN] §7.3.5, nota "i": "It may take three hours…").
+- Tras un reinicio por cambio de configuración, tarda unos 1 min en volver a operar ([MAN] §8.1.3 y §8.1.4).
+
+## D14. Formato de almacenamiento
+
+- **Decisión:** guardar los datos en CSV largo (una fila por sensor y ciclo), un CSV con promedios de 1 minuto y un `run.json` con los metadatos.
+- **Fuente:** [MAN] §9.1: "The instrument has no internal data memory". El PC es el único registro de los datos, así que el CSV se vacía a disco en cada ciclo.
+- **Datos incluidos en `run.json`:** [MAN] §12.1 pide, para cualquier soporte técnico, el modelo, el número de serie, archivos de datos de ejemplo y el sistema de adquisición.
