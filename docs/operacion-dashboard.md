@@ -35,8 +35,14 @@ make build
 make acquire
 ```
 
-En la segunda: `make web`. `make frontend` abre el servidor de desarrollo Vite
-con proxy a la API del puerto 8050; la instalación normal usa el build estático.
+En la segunda: `make web`. La instalación normal sirve el build estático en
+http://127.0.0.1:8050. Para **desarrollar el frontend con recarga automática**,
+abrir una tercera terminal con `make frontend` o `bun run --cwd frontend dev`
+y visitar **http://127.0.0.1:5173** (o el puerto que muestre Vite si está ocupado).
+Ese servidor usa un proxy a la API del puerto 8050. No requiere reconstruir el
+frontend después de cada edición. No arrancar también `make run`, porque ya
+inicia adquisición y API. El [README](../README.md#iniciar-el-frontend-en-desarrollo)
+incluye los tres comandos para Linux/macOS y Windows.
 Si cambia el puerto API, ajustar también el proxy de desarrollo en `vite.config.ts`.
 
 ### Windows sin Make

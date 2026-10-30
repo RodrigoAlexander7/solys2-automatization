@@ -29,6 +29,52 @@ sobrescribirlo; la plantilla usa sensores **simulados**. Para hardware, cambiar
 simulado), `make docker-web` (solo web con adquisición nativa). Las instrucciones
 para Windows sin Make están en [operación](docs/operacion-dashboard.md).
 
+### Iniciar el frontend en desarrollo
+
+Desde la raíz del repositorio, ejecutar `make install` una vez y abrir **tres
+terminales**. Mantener estos procesos activos:
+
+| Terminal | Con Make | Sin Make, Linux/macOS | Función |
+|---|---|---|---|
+| 1 | `make acquire` | `.venv/bin/python -m smp22x log --no-plot` | Adquisición → SQLite |
+| 2 | `make web` | `.venv/bin/python -m smp22x dashboard` | API FastAPI en http://127.0.0.1:8050 |
+| 3 | `make frontend` | `bun run --cwd frontend dev` | Frontend SvelteKit con recarga automática |
+
+**Abrir http://127.0.0.1:5173 para desarrollar el frontend.** Si ese puerto está
+ocupado, Vite muestra el puerto alternativo en la terminal. El frontend envía
+`/api` a FastAPI en el puerto 8050 mediante el proxy de
+[`frontend/vite.config.ts`](frontend/vite.config.ts). Iniciar solo SvelteKit permite
+ver la interfaz, pero para consultar datos necesita la API; para generar nuevas
+muestras necesita también la adquisición. No ejecutar a la vez `make run` y
+esta secuencia, porque `make run` ya inicia adquisición y API.
+
+En **Windows sin Make**, completar primero la instalación de
+[operación](docs/operacion-dashboard.md#windows-sin-make). Luego usar tres
+terminales PowerShell en la raíz:
+
+```powershell
+# Terminal 1: adquisición
+.venv\Scripts\python -m smp22x log --no-plot
+```
+
+```powershell
+# Terminal 2: API
+.venv\Scripts\python -m smp22x dashboard
+```
+
+```powershell
+# Terminal 3: frontend
+bun run --cwd frontend dev
+```
+
+### Usar el frontend compilado
+
+`make run` ejecuta `make build` y arranca adquisición y API. En este modo se
+abre **http://127.0.0.1:8050**, y FastAPI sirve los archivos compilados de SvelteKit;
+no hace falta ejecutar `make frontend`. Para reconstruir y arrancar por separado:
+`make build`, después `make acquire` y `make web` en terminales distintas.
+Docker también sirve el frontend compilado en el puerto 8050 por defecto.
+
 La [especificación SDD](docs/sdd/spec.md), su [diseño](docs/sdd/design.md) y la
 [evidencia de tests](docs/sdd/tasks.md) describen requisitos, casos límite y
 validación. `make check` y `make test` ejecutan verificaciones de frontend/backend.
