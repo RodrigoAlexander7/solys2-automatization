@@ -12,10 +12,14 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import math
 from pathlib import Path
 
 from . import registers as reg
 from .sensor import LW_CHECK_TOLERANCE_WM2
+from .config import environment, settings
+from .result import StorageFailure, require
+from .tracing import configure_logging
 from .transport import (
     BusError,
     PortError,
@@ -215,6 +219,12 @@ def cmd_log(args) -> int:
     from .acquisition import Acquisition, AcquisitionConfig
 
     types = sensor_types(args)
+    if not math.isfinite(args.interval) or args.interval <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+        raise ValueError("Intervalo y timeout deben ser positivos y finitos")
+    if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
+        raise ValueError("Duración debe ser positiva y finita")
+    if not math.isfinite(args.diag_every) or args.diag_every <= 0:
+        raise ValueError("diag-every debe ser positivo y finito")
     blocks = [
         reg.PYRGEOMETER_BLOCK_COUNT if t == reg.PYRGEOMETER else reg.FAST_BLOCK_COUNT
         for t in types.values()
@@ -232,6 +242,7 @@ def cmd_log(args) -> int:
         label=args.label,
         simulated=args.simulate,
         live=not args.quiet,
+        db_path=Path(args.db),
     )
     try:
         run_dir = Acquisition(bus, cfg).run()
@@ -256,6 +267,27 @@ def _plot(path: Path) -> int:
 
 def cmd_plot(args) -> int:
     return _plot(Path(args.path))
+
+
+def cmd_dashboard(args) -> int:
+    import uvicorn
+    from dataclasses import replace
+    from .api import create_app
+    cfg = replace(settings(), db=Path(args.db))
+    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, workers=1)
+    return 0
+
+
+def cmd_export(args) -> int:
+    from .storage import Reader
+    require(Reader(Path(args.db)).export(args.run_id, Path(args.out)))
+    return 0
+
+
+def cmd_backup(args) -> int:
+    from .storage import Reader
+    require(Reader(Path(args.db)).backup(Path(args.destination)))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -293,11 +325,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-clear", action="store_true", help="no enviar IO_CLEAR_ERROR")
     p.add_argument("--no-plot", action="store_true", help="no generar gráficas al terminar")
     p.add_argument("--quiet", "-q", action="store_true", help="no imprimir cada ciclo")
+    p.add_argument("--db", default="data/acquisition.sqlite3", help="SQLite compartido con dashboard")
     p.set_defaults(func=cmd_log)
 
     p = sub.add_parser("plot", help="grafica una prueba guardada")
     p.add_argument("path", help="carpeta de la prueba o su raw_1s.csv")
     p.set_defaults(func=cmd_plot)
+
+    p = sub.add_parser("dashboard", help="API y dashboard; no consulta Modbus")
+    p.add_argument("--db", default="data/acquisition.sqlite3")
+    p.set_defaults(func=cmd_dashboard)
+
+    p = sub.add_parser("export", help="exporta una corrida SQLite a CSV compatible")
+    p.add_argument("run_id")
+    p.add_argument("--out", required=True, help="carpeta nueva")
+    p.add_argument("--db", default="data/acquisition.sqlite3")
+    p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("backup", help="copia consistente de SQLite en uso")
+    p.add_argument("destination")
+    p.add_argument("--db", default="data/acquisition.sqlite3")
+    p.set_defaults(func=cmd_backup)
+
+    e = environment()
+    for name in ("scan", "info", "log"):
+        sub.choices[name].set_defaults(port=e.get("SMP_SERIAL_PORT", "auto"),
+            baud=int(e.get("SMP_BAUD", "19200")), parity=e.get("SMP_PARITY", "E"),
+            timeout=float(e.get("SMP_TIMEOUT_S", "0.3")), simulate=e.get("SMP_SIMULATE", "0").lower() in {"1", "true", "yes"})
+    for name in ("info", "log"):
+        sub.choices[name].set_defaults(addresses=[int(x) for x in e.get("SMP_ADDRESSES", "2 3 4").split()],
+            pyrgeometers=[int(x) for x in e.get("SMP_PYRGEOMETERS", "2").split()])
+    sub.choices["log"].set_defaults(interval=float(e.get("SMP_INTERVAL_S", "1")),
+        out=e.get("SMP_OUT_DIR", "data"), label=e.get("SMP_LABEL", ""))
+    for name in ("log", "dashboard", "export", "backup"):
+        sub.choices[name].set_defaults(db=e.get("SMP_DB_PATH", "data/acquisition.sqlite3"))
     return parser
 
 
@@ -305,9 +366,18 @@ def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
-    args = build_parser().parse_args(argv)
     try:
+        configure_logging(environment().get("SMP_LOG_LEVEL", "INFO"))
+        args = build_parser().parse_args(argv)
+        if args.command == "log":
+            import signal
+            def stop(signum, frame):
+                raise KeyboardInterrupt()
+            signal.signal(signal.SIGTERM, stop)
         return args.func(args)
     except PortError as exc:
         print(f"Error de puerto: {exc}", file=sys.stderr)
         return 2
+    except (ValueError, StorageFailure) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 3

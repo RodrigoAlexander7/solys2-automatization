@@ -8,7 +8,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from . import registers as reg
-from .transport import BusError, ModbusBus
+from .transport import BusError, ModbusBus, PortError
+from .tracing import emit, traced
+from typing import Literal
+
+SampleError = Literal["communication_error", "invalid_register_block", "unsupported_scale", "diagnostic_error"]
 
 
 def to_s16(value: int) -> int:
@@ -90,6 +94,8 @@ class Sample:
     rh_pct: float | None = None
     pressure_hpa: float | None = None
     rtt_ms: float | None = None
+    error_code: SampleError | None = None
+    raw_registers: dict[int, int] = field(default_factory=dict)
 
     @property
     def measurement(self) -> float | None:
@@ -180,6 +186,7 @@ class SMPSensor:
             info.warnings.append(f"IO_NODE_ID={info.node_id} no coincide con la dirección consultada")
         return info
 
+    @traced("SMPSensor.read_sample", expected=(PortError,))
     def read_sample(self, with_diagnostics: bool = False) -> Sample:
         t0 = time.perf_counter()
         try:
@@ -187,12 +194,17 @@ class SMPSensor:
                 self.address, reg.FAST_BLOCK_START, self.block_count
             )
         except BusError as exc:
+            emit("Modbus.read", "FAILED", (time.perf_counter() - t0) * 1000,
+                 address=self.address, error="communication_error", message=str(exc))
             return Sample(
                 self.address, datetime.now(timezone.utc), ok=False, error=str(exc),
-                sensor_type=self.sensor_type,
+                sensor_type=self.sensor_type, error_code="communication_error",
             )
         rtt_ms = (time.perf_counter() - t0) * 1000.0
         now = datetime.now(timezone.utc)
+        if len(regs) != self.block_count or any(type(x) is not int or not 0 <= x <= 65535 for x in regs):
+            return Sample(self.address, now, ok=False, sensor_type=self.sensor_type,
+                          error="Bloque Modbus incompleto o fuera de U16", error_code="invalid_register_block")
 
         mode, status, scale_raw, s1, raw1, stdev, body_t, ext_v = regs[:reg.FAST_BLOCK_COUNT]
         scale = to_s16(scale_raw)
@@ -210,6 +222,7 @@ class SMPSensor:
             body_temp_c=to_s16(body_t) / 10.0,
             supply_v=to_s16(ext_v) / 10.0,
             rtt_ms=rtt_ms,
+            raw_registers={reg.FAST_BLOCK_START + i: value for i, value in enumerate(regs)},
         )
         if self.sensor_type == reg.PYRGEOMETER:
             s2, raw2 = regs[reg.FAST_BLOCK_COUNT:]
@@ -217,15 +230,18 @@ class SMPSensor:
             sample.raw_lw_down = scale_sensor_value(raw2, scale)
         if sample.irradiance is None:
             sample.error = f"IO_SCALE_FACTOR={scale} no documentado"
+            sample.error_code = "unsupported_scale"
 
         if with_diagnostics:
             try:
                 rh, pressure = self.bus.read_input_registers(self.address, reg.IO_RH, 2)
                 sample.rh_pct = rh / 10.0
                 sample.pressure_hpa = pressure_to_hpa(pressure)
+                sample.raw_registers.update({reg.IO_RH: rh, reg.IO_PRESSURE: pressure})
             except BusError as exc:
                 # Se añade al error de escala, si lo hay, en vez de taparlo
                 sample.error = "; ".join(filter(None, [sample.error, f"diagnóstico: {exc}"]))
+                sample.error_code = sample.error_code or "diagnostic_error"
         return sample
 
     def clear_error(self) -> None:

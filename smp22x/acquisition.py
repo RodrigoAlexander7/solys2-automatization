@@ -19,11 +19,15 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 from typing import TextIO
 
 from . import registers as reg
 from .sensor import DeviceInfo, Sample, SMPSensor
 from .transport import BusError, ModbusBus, PortError, read_transaction_wire_time_s
+from .result import require
+from .storage import Writer
+from .tracing import emit, traced
 
 RAW_COLUMNS = [
     "time_utc", "time_local", "cycle", "address", "sensor_type",
@@ -54,6 +58,7 @@ class AcquisitionConfig:
     label: str = ""
     simulated: bool = False
     live: bool = True
+    db_path: Path | None = None
 
 
 @dataclass
@@ -141,7 +146,14 @@ class Acquisition:
         self.overruns = 0
         self.port_errors = 0
         self.port_downtime_s = 0.0
-        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        if not math.isfinite(cfg.interval_s) or cfg.interval_s <= 0:
+            raise ValueError("interval_s debe ser positivo y finito")
+        if len(set(cfg.addresses)) != len(cfg.addresses) or not cfg.addresses:
+            raise ValueError("Las direcciones deben ser únicas y no vacías")
+        self.run_id = uuid4().hex
+        self.writer: Writer | None = None
+        self._deadline: float | None = None
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
         name = f"{stamp}_{cfg.label}" if cfg.label else stamp
         if cfg.simulated:
             name += "_SIM"
@@ -187,6 +199,8 @@ class Acquisition:
         self._log(f"!! Puerto perdido: {exc}. Reintentando cada {PORT_RETRY_S:.0f} s (Ctrl+C para salir)")
         try:
             while True:
+                if self._deadline is not None and time.monotonic() >= self._deadline:
+                    raise TimeoutError("Duración alcanzada durante reconexión")
                 time.sleep(PORT_RETRY_S)
                 try:
                     self.bus.reopen()
@@ -207,6 +221,7 @@ class Acquisition:
     def _write_meta(self, started: datetime, ended: datetime | None, reason: str) -> None:
         cfg = asdict(self.cfg)
         cfg["out_dir"] = str(self.cfg.out_dir)
+        cfg["db_path"] = str(self.cfg.db_path) if self.cfg.db_path else None
         per_sensor = {}
         baud, parity = self.bus.baudrate, self.bus.parity
         wire_ms = {
@@ -230,6 +245,7 @@ class Acquisition:
                 "last_error": st.last_error,
             }
         meta = {
+            "run_id": self.run_id,
             "bus": self.bus.description,
             "simulated": self.cfg.simulated,
             "started_local": started.astimezone().isoformat(timespec="seconds"),
@@ -297,38 +313,57 @@ class Acquisition:
         return f"{clock}  " + "   ".join(parts) + f"  W/m²   ciclo {cycle_ms:5.0f} ms"
 
     # ------------------------------------------------------------------- run
+    @traced("Acquisition.run")
     def run(self) -> Path:
         cfg = self.cfg
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.run_dir.mkdir(parents=True, exist_ok=False)
         started = datetime.now(timezone.utc)
+        self._deadline = time.monotonic() + cfg.duration_s if cfg.duration_s is not None else None
         self._log(f"Bus: {self.bus.description}")
         self._log(
             f"Sensores {cfg.addresses} (pirgeómetros: {cfg.pyrgeometers or 'ninguno'}), "
             f"intervalo {cfg.interval_s:g} s, salida {self.run_dir}"
         )
-        self._log("Identificación:")
-        self._identify()
-        if cfg.clear_errors:
-            for sensor in self.sensors:
-                if sensor.address in self.infos:
-                    self._clear_error(sensor, self.state[sensor.address], time.monotonic())
-        self._write_meta(started, None, "running")
-
-        reason = "duration"
-        with open(self.raw_path, "w", newline="", encoding="utf-8") as raw_f, \
-                open(self.minute_path, "w", newline="", encoding="utf-8") as min_f:
-            raw_w, min_w = csv.writer(raw_f), csv.writer(min_f)
-            raw_w.writerow(RAW_COLUMNS)
-            min_w.writerow(MINUTE_COLUMNS)
-            aggregator = _MinuteAggregator(min_w, cfg.interval_s)
+        self.writer = Writer(cfg.db_path or self.run_dir / "run.sqlite3")
+        require(self.writer.open())
+        reason = "error"
+        initialized = False
+        try:
+            self._write_meta(started, None, "running")
+            require(self.writer.start(self.run_id, json.loads(self.meta_path.read_text())))
+            initialized = True
+            self._log("Identificación:")
+            self._identify()
+            if cfg.clear_errors:
+                for sensor in self.sensors:
+                    if sensor.address in self.infos:
+                        self._clear_error(sensor, self.state[sensor.address], time.monotonic())
+            self._write_meta(started, None, "running")
+            # Refresh identity metadata before the first cycle.
+            require(self.writer.metadata(self.run_id, json.loads(self.meta_path.read_text())))
+            with open(self.raw_path, "w", newline="", encoding="utf-8") as raw_f, \
+                    open(self.minute_path, "w", newline="", encoding="utf-8") as min_f:
+                raw_w, min_w = csv.writer(raw_f), csv.writer(min_f)
+                raw_w.writerow(RAW_COLUMNS)
+                min_w.writerow(MINUTE_COLUMNS)
+                aggregator = _MinuteAggregator(min_w, cfg.interval_s)
+                try:
+                    self._loop(raw_f, raw_w, min_f, aggregator)
+                    reason = "duration"
+                except TimeoutError:
+                    reason = "duration"
+                except KeyboardInterrupt:
+                    reason = "ctrl+c"
+                    self._log("\nDetenido por el usuario.")
+                finally:
+                    aggregator.flush()
+        finally:
             try:
-                self._loop(raw_f, raw_w, min_f, aggregator)
-            except KeyboardInterrupt:
-                reason = "ctrl+c"
-                self._log("\nDetenido por el usuario.")
-            finally:
-                aggregator.flush()
                 self._write_meta(started, datetime.now(timezone.utc), reason)
+                if initialized:
+                    require(self.writer.finish(self.run_id, reason, json.loads(self.meta_path.read_text())))
+            finally:
+                self.writer.close()
         self._print_summary()
         return self.run_dir
 
@@ -363,9 +398,14 @@ class Acquisition:
                 st.requests += 1
                 self._account(sensor, st, sample)
                 samples.append(sample)
+            cycle_ms = (time.monotonic() - cycle_start) * 1000
+            require(self.writer.commit_cycle(self.run_id, cycle, samples, {
+                "cycle": cycle, "cycle_ms": cycle_ms, "port_errors": self.port_errors,
+                "overruns": self.overruns, "port_downtime_s": self.port_downtime_s,
+            }))
+            for sample in samples:
                 raw_w.writerow(self._row(cycle, sample))
                 aggregator.add(sample)
-            cycle_ms = (time.monotonic() - cycle_start) * 1000
             raw_f.flush()
             min_f.flush()
             if cfg.live and samples:
