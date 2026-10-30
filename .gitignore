@@ -2,3 +2,15 @@
 __pycache__/
 *.pyc
 data/
+.env
+.env.*
+!.env.example
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.writer.lock
+playwright-report/
+test-results/

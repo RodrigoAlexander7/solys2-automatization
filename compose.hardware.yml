@@ -1,0 +1,9 @@
+# Linux con dispositivo serie. Windows real: adquisición nativa recomendada.
+services:
+  acquisition:
+    command: ["python", "-m", "smp22x", "log", "--no-plot"]
+    environment:
+      SMP_SIMULATE: "0"
+      SMP_SERIAL_PORT: ${SMP_DEVICE:-/dev/ttyUSB0}
+    devices:
+      - "${SMP_DEVICE:-/dev/ttyUSB0}:${SMP_DEVICE:-/dev/ttyUSB0}"
