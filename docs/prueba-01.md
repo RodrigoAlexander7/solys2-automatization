@@ -1,67 +1,79 @@
 # Prueba 01 — 2026-09-28 18:20, COM10
 
-**Comando:** `python -m smp22x log -d 30m --label prueba01`. Se detuvo con Ctrl+C a los 113 ciclos (~2 min).
+## 1. Datos registrados en la nota original
 
-**Carpeta de datos:** `data/2026-09-28_182028_prueba01/`
+Comando: `python -m smp22x log -d 30m --label prueba01`. Se detuvo con Ctrl+C
+a los 113 ciclos, aproximadamente 2 min. Carpeta indicada:
+`data/2026-09-28_182028_prueba01/`.
 
-## Comunicación: correcta
+Esta revisión ordena los resultados previamente anotados. La carpeta de datos
+original no está disponible en el árbol actual; no se han recalculado aquí los
+estadísticos ni recuperado variables que no estuvieran en la nota.
 
-| Sensor | Respuestas | Válidas | RTT medio |
+| Dirección | Instrumento identificado en el montaje | Serie | Código de tipo | Modelo de datos | Software / hardware |
+|---|---|---|---|---|---|
+| 2 | SGR4, pirgeómetro | 240466 | 611 | 102 | 300 / 5 |
+| 3 | SMP22x, piranómetro | 240349 | 607 | 100 | 201 / 5 |
+| 4 | SMP22x, piranómetro | 240350 | 607 | 100 | 201 / 5 |
+
+Los códigos 607 y 611 fueron observados; los PDF locales no los asignan
+explícitamente a esos modelos. El manual SMP V20 §15.6 p. 47 documenta 635 y
+636 y exige comprobar diferencias con modelos de datos anteriores a 108.
+El tipo físico del sensor 2 fue aclarado por el usuario después de esta prueba.
+
+## 2. Comunicación observada
+
+| Sensor | Respuestas | Filas marcadas válidas por el software entonces | RTT medio |
 |---|---|---|---|
 | #2 | 113/113 | 113 | 28 ms |
 | #3 | 113/113 | 113 | 32 ms |
 | #4 | 113/113 | 113 | 34 ms |
 
-- **Ciclo completo:** 93 ms de media (p95: 109 ms).
-- **Ocupación del bus:** ~9 % leyendo cada 1 s.
-- **Ciclos perdidos:** 0.
+Ciclo medio 93 ms; p95 109 ms; ocupación estimada del ciclo ~9 % con intervalo
+1 s; ciclos perdidos anotados: 0. Son tiempos del programa, no de respuesta
+física de los detectores. La prueba usaba el bloque 2–9 para todos; todavía no
+incluía los registros 10–11 del SGR4.
 
-Confirma el presupuesto de tiempo de [decisiones-tecnicas.md D10](decisiones-tecnicas.md#d10-presupuesto-de-tiempo-del-bus): ~21 ms en el cable + ~10 ms de latencia USB y respuesta del sensor.
+`valid` refleja las reglas del software, no una validación independiente del
+mapa o de la calibración. Ver [guía de registros](lectura-registros.md).
 
-## Identificación: firmware distinto al del manual V20
+## 3. Mediciones y lectura actual de los resultados
 
-| Sensor | Serie | IO_DEVICE_TYPE | Data model | Software / hardware |
-|---|---|---|---|---|
-| #2 | 240466 | 611 | 102 | 300 / 5 |
-| #3 | 240349 | 607 | 100 | 201 / 5 |
-| #4 | 240350 | 607 | 100 | 201 / 5 |
-
-- Los tres sensores son del lote 2024 (manual V20 §15.10).
-- Ninguno reporta el código 636 (SMP22x) que documenta el manual V20 §15.6.
-- El data model 100 corresponde al manual SMP de 2015, Apéndice A. En ese manual, el bloque de registros 2–9 es idéntico, así que la irradiancia se interpreta correctamente. Ver [D12](decisiones-tecnicas.md#d12-compatibilidad-con-el-firmware-detectado-en-la-prueba-01).
-- El sensor #2 tiene un firmware distinto al de #3 y #4 (código 611, software 300). **Hay que confirmar que los tres son realmente SMP22x.**
-
-## Mediciones: el sensor #2 da un valor anómalo
-
-> **Actualización:** el sensor #2 es un **pirgeómetro SGR4**, no un SMP22x. El
-> registro 5 que se leyó como "irradiancia" es, en el SGR4, la **radiación neta
-> de onda larga** (manual V20 §15.2: "Net radiation for SGR"), que es negativa
-> cuando el cielo está más frío que el sensor. Un valor de −160 W/m² es normal
-> con cielo despejado: con el cuerpo a unos 25 °C (σT⁴ ≈ 448 W/m²), equivale a
-> una onda larga descendente Ld↓ ≈ 290 W/m². El análisis de abajo se escribió
-> antes de saberlo y se deja como registro. Ver
-> [D15](decisiones-tecnicas.md#d15-sensor-2-pirgeómetro-sgr4).
-
-| Sensor | Rango observado | Observación |
+| Sensor | Rango anotado del registro 5 convertido | Interpretación |
 |---|---|---|
-| #2 | −160 a −163 W/m² | Negativo y casi constante |
-| #3 | 950–958 W/m² | Coherente con #4 |
-| #4 | 940–947 W/m² | ~10 W/m² por debajo de #3 |
+| #2 | −160 a −163 W/m² | Compatible con radiación neta de un pirgeómetro; no comparar con onda corta |
+| #3 | 950–958 W/m² | Irradiancia de onda corta |
+| #4 | 940–947 W/m² | Irradiancia de onda corta; diferencia aproximada de 10 W/m² respecto a #3 |
 
-- **El valor de #2 no es físicamente plausible.** El rango de salida del sensor llega hasta −400 W/m² (DS, "Serial output range"; manual V20 §15.8, UNDERFLOW). Pero el offset térmico total esperado es menor de 7 W/m² (DS, "total zero offset"), así que un valor de −160 W/m² no se explica por la física del sensor.
-- **Causas posibles:**
-  1. Una escala o un mapa de registros distinto por su firmware (IO_DEVICE_TYPE 611, data model 102). Es la causa más probable porque es el único sensor con ese firmware.
-  2. Un fallo del sensor.
-- Con `info -a 2` se puede ver el factor de escala y la irradiancia bruta (`raw_irradiance_wm2` en el CSV) de #2.
-- **Hora de la prueba:** a las 18:20 hora local, unos 950 W/m² en #3 y #4 solo es posible con una fuente artificial (lámpara) o con el sol todavía alto. **Anotar las condiciones de cada prueba.**
-- **Resolución:** todos los valores son enteros. Esto indica que IO_SCALE_FACTOR = 0, es decir, resolución de 1 W/m² (manual V20 §15.6). Se puede comprobar en el CSV.
+La interpretación original llamaba «anómalo» al valor de #2 y sugería un fallo.
+Esa conclusión se basaba en tratarlo como piranómetro y queda retirada. SMP
+§15.2 p. 43 identifica el registro 5 como radiación neta para SGR; SGR §7.1.5
+p. 17 explica por qué puede ser negativa.
 
-## Próximos pasos
+Ejemplo ilustrativo: con temperatura del cuerpo 25 °C y neta −160 W/m²,
+`Ld↓ = neta + σT⁴` da aproximadamente 288 W/m². La temperatura de ese ejemplo
+no es una medición recuperada de esta prueba. No permite afirmar cielo despejado
+ni reconstruir Ld↓ real, porque tampoco se leyeron 10–11.
 
-Actualizados tras identificar el SGR4:
+La hora 18:20 sin ubicación, orientación, fuente de radiación y condiciones
+anotadas no basta para explicar las irradiancias. Que los valores publicados
+sean enteros tampoco prueba por sí solo factor 0: puede haber redondeo del
+sensor o de la presentación. El factor debe verificarse en una lectura real.
 
-1. Ejecutar `python -m smp22x info` y comprobar en el sensor #2 que la verificación "neta + σT⁴" coincide con Ld↓ (diferencia dentro de ±5 W/m²). Confirma que el firmware 102 tiene los registros 10–11.
-2. Preguntar a OTT HydroMet a qué modelo corresponden los códigos 607 y 611 (manual V20 §12.1).
-3. Repetir la prueba 30 min con el sol o la lámpara, anotando las condiciones. Una lámpara también calienta y cambia la lectura del pirgeómetro, así que anotar si estaba encendida.
+Humedad y presión no deben interpretarse con estos firmwares sin confirmar
+16–17: en mapas anteriores pueden tener otro significado ([D12](decisiones-tecnicas.md#d12-compatibilidad-con-el-firmware-detectado-en-la-prueba-01)).
 
-Pasos originales ya resueltos: revisar la escala de #2 con `info -a 2` e intercambiar físicamente #2 y #3. El valor no era un fallo, era otra magnitud.
+## 4. Comprobaciones siguientes
+
+1. Ejecutar `python -m smp22x info` con hardware y registrar tipo, mapa, factor,
+   modo y flags. Comparar Ld↓ con neta + σT⁴; el umbral ±5 W/m² es del proyecto.
+   Una coincidencia es evidencia de consistencia, no prueba completa del mapa.
+2. Confirmar con el fabricante códigos 607/611 y el mapa para data model 102,
+   especialmente 10–11 y 16–17, aportando las series anteriores.
+3. Repetir una prueba más larga con fecha/zona, ubicación, orientación, fuente,
+   sombreado, limpieza, tiempo desde encendido y cambios de condiciones anotados.
+4. Conservar la lectura original antes de aplicar nuevas conversiones y comparar
+   solo magnitudes equivalentes. Las lecturas de un ciclo son secuenciales.
+
+Referencias locales: [manual SMP V20](../references/pyranometer-SMP22x/Operational_Manual_SMP10x_SMP22x_Smart_Pyranometers_V20.pdf#page=43)
+y [manual SGR V10](../references/pyrgeometer-SGR4/Operational_Manual_CGR4_SGR4_V10.pdf#page=17).

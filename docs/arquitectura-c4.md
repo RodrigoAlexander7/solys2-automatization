@@ -1,5 +1,10 @@
 # Cómo funciona el lector de radiómetros SMP22x + SGR4
 
+**Arquitectura implementada actualmente:** CLI y CSV. El diseño futuro con
+SQLite, FastAPI y SvelteKit está separado en el [plan del dashboard](plan-dashboard.md).
+Para direcciones, conversiones y páginas de los manuales, consultar la
+[guía de registros](lectura-registros.md).
+
 Es un programa de terminal en Python que, cada segundo, le pregunta a tres
 sensores de radiación cuánta energía están recibiendo, guarda las respuestas en
 CSV y al final dibuja gráficas. Dos son piranómetros (luz solar) y uno es un
@@ -106,9 +111,9 @@ flowchart LR
 | Contenedor | Qué hace | Equivalente web |
 |---|---|---|
 | App CLI smp22x | Un solo proceso que vive mientras dura el comando. Con `log` queda en bucle hasta la duración pedida o Ctrl+C. | Un script de Node que corres con `npx`, sin servidor. |
-| Carpeta de prueba | Cada `log` crea una carpeta nueva. Se hace `flush` en cada ciclo, así que un corte no pierde lo ya leído. | La base de datos, append-only. |
+| Carpeta de prueba | Cada `log` crea una carpeta nueva y hace `flush` por ciclo. Reduce datos pendientes en memoria, pero no garantiza persistencia ante pérdida de energía. | Almacenamiento de filas en archivos. |
 | Puerto COM + PMU485 | El programa abre `COM10` como si fuera un archivo y escribe bytes. Driver y caja hacen el resto. | El socket TCP y la tarjeta de red. |
-| Los 3 sensores | Responden a Modbus. Actualizan la medida una vez por segundo: leer más rápido no aporta nada. El SGR4 además responde lento a los cambios (63 % en < 6 s). | Tres APIs externas con rate limit físico. |
+| Los 3 sensores | Responden a consultas secuenciales. La actualización de registro, el intervalo de lectura y el tiempo de respuesta físico son conceptos distintos. SGR §13.1 p. 29 indica respuesta 63 % <6 s. | Tres APIs externas consultadas por un worker. |
 
 ## C4 nivel 3 · Componentes
 
@@ -199,7 +204,7 @@ sequenceDiagram
 | Se desconecta el USB | `PortError` → se corta el ciclo y se reabre el puerto cada 2 s hasta que vuelva o Ctrl+C. Cuenta en `port_errors`, no como error del sensor, y el bucle se vuelve a alinear al reloj. | `acquisition._recover_port`, `_loop` |
 | Flags de arranque (ERROR, POWER_FAILED) | No invalidan la medida. Se borran con el coil 10, máximo una vez cada 30 s por sensor. | `acquisition._clear_error` |
 | Cambia el minuto | Se cierra el minuto anterior: n.º de muestras, media, mín, máx, desviación. `complete=1` si ≥ 80 % válidas. | `_MinuteAggregator` |
-| Cada 60 s | Lee además humedad y presión internas (registros 16–17). | `read_sample(with_diagnostics)` |
+| Cada 60 s | Consulta 16–17; no interpretar humedad/presión como fiables sin confirmar el firmware antiguo. | `read_sample(with_diagnostics)` |
 | El ciclo pasa de 1 s | Salta al siguiente segundo libre y cuenta un `overrun`. | `acquisition._loop` |
 
 En la [prueba 01](prueba-01.md) cada ciclo de 3 sensores tardó 93 ms de media

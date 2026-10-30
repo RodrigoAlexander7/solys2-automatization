@@ -22,6 +22,11 @@ Documentación oficial en [`references/`](references/):
   operación CGR4/SGR4 V10 (citado como "manual SGR4") y folleto de
   pirgeómetros. El manual SGR4 no incluye mapa de registros.
 
+Para entender las direcciones y las conversiones, empiece por la
+[guía de lectura de registros](docs/lectura-registros.md): contiene significado,
+tipo, fórmula, unidad y página del manual para ambos sensores.
+El [índice de documentación](docs/README.md) propone un orden de lectura.
+
 Notas del proyecto en [`docs/`](docs/): [decisiones técnicas](docs/decisiones-tecnicas.md),
 [arquitectura explicada con C4](docs/arquitectura-c4.md),
 [prueba 01](docs/prueba-01.md) y [plan del dashboard en tiempo real](docs/plan-dashboard.md).
@@ -92,8 +97,10 @@ sensor activa siempre al arrancar (§15.8).
 
 En el pirgeómetro muestra la radiación neta, Ld↓ y una **verificación**: Ld↓
 calculado como neta + σT⁴ (manual SGR4 §7.1.5) frente a Ld↓ leído. Si difieren
-más de 5 W/m², avisa y termina con código 1: el firmware no sigue el mapa de
-registros esperado (ver D15 en [decisiones técnicas](docs/decisiones-tecnicas.md)).
+más de 5 W/m², avisa y termina con código 1: se debe investigar la interpretación
+de registros, escala y temperatura. La coincidencia es una comprobación de
+consistencia, no una calibración ni una demostración completa de compatibilidad
+(ver D15 en [decisiones técnicas](docs/decisiones-tecnicas.md)).
 
 **Qué dirección es el pirgeómetro.** Por defecto, la 2. Se cambia con
 `--pyrgeometers` en `info` y `log`: `--pyrgeometers 5` si estuviera en la 5, o
@@ -133,7 +140,8 @@ por defecto (`--interval 1`).
 | Tiempo de respuesta del SGR4 | 63 % < 6 s · 95 % < 18 s | Manual SGR4 §13.1 |
 
 El pirgeómetro es mucho más lento que los piranómetros, así que leerlo cada 1 s
-le sobra. Se lee en el mismo ciclo para que todas las filas compartan instante.
+es compatible con un ciclo de 1 s. Las lecturas son secuenciales: compartir
+ciclo permite agruparlas, pero sus marcas de tiempo son distintas.
 
 - **Menos de 1 s no aporta información.** El registro solo cambia una vez por
   segundo, así que se leerían valores repetidos y se ocuparía el bus para nada.
@@ -143,8 +151,9 @@ le sobra. Se lee en el mismo ciclo para que todas las filas compartan instante.
 - `IO_STDEV_SENSOR1` es la desviación desde la lectura anterior (§15.6). A 1 s
   sale casi 0. Para ver la variabilidad dentro de cada minuto, use la columna
   `std_wm2` de `minute_avg.csv`.
-- Humedad relativa y presión internas (diagnóstico del desecante): se leen cada
-  60 s (`--diag-every`).
+- Humedad relativa y presión internas: se leen cada 60 s (`--diag-every`), pero
+  su interpretación no está validada para el firmware antiguo del montaje.
+  No usarlas como diagnóstico fiable hasta confirmar el mapa (guía, sección 5).
 
 ### Carga del bus a 19200 baud 8E1 (11 bits por carácter = 0,573 ms)
 
@@ -172,8 +181,9 @@ Por qué el ciclo es robusto:
 
 - Las peticiones van **en serie**, una detrás de otra. Modbus RTU es semidúplex
   y con un solo maestro, así que nunca se hacen peticiones en paralelo.
-- Los ciclos arrancan en segundos exactos del reloj, de modo que cada minuto
-  tiene exactamente 60 muestras.
+- El programa intenta alinear ciclos al segundo. Con intervalo 1 s, un minuto
+  completo sin pérdidas tiene 60 muestras por sensor; inicio/fin parciales,
+  desconexiones y backoff pueden reducirlas.
 - Si un sensor falla 5 veces seguidas, solo se le vuelve a consultar cada 10
   ciclos. Así no se retrasa a los demás.
 - Si se desconecta el USB, el programa intenta reabrir el puerto cada 2 s. Esa
@@ -195,13 +205,15 @@ Por cada prueba se crea `data/<fecha>_<hora>[_etiqueta]/` con:
 
 - **`raw_1s.csv`**: una fila por sensor y ciclo. Columnas:
   - `time_utc` y `time_local`: marca de tiempo.
-  - `cycle`: número de ciclo. Las filas del mismo ciclo corresponden al mismo instante.
+  - `cycle`: agrupa lecturas secuenciales; no indica simultaneidad.
   - `address`: dirección del sensor.
   - `sensor_type`: `pyranometer` o `pyrgeometer`.
   - `irradiance_wm2`: `IO_SENSOR1_DATA`. En los piranómetros es la irradiancia
     global compensada en temperatura. **En el pirgeómetro es la radiación neta
     del detector**, normalmente negativa (§15.2).
-  - `raw_irradiance_wm2`: `IO_RAW_SENSOR1_DATA`.
+  - `raw_irradiance_wm2`: `IO_RAW_SENSOR1_DATA`, ya convertido a W/m²; no son
+    enteros originales del bus. Actualmente el CSV tampoco conserva el factor
+    de escala de cada lectura.
   - `lw_down_wm2` y `raw_lw_down_wm2`: solo pirgeómetro. `IO_SENSOR2_DATA` e
     `IO_RAW_SENSOR2_DATA`, radiación de onda larga descendente Ld↓.
   - `stdev_wm2`, `body_temp_c`, `supply_v`.
@@ -260,9 +272,10 @@ flags: `VOID_DATA`, `OVERFLOW`, `UNDERFLOW`,
   108. Los registros 10–11 (Ld↓) están documentados en V20, pero no se ha
   podido confirmar que existan con ese significado en el data model 102. La
   verificación de `info` sirve justo para eso.
-- Unidad de `IO_PRESSURE`: el manual dice "hPa" en §15.2 y "0,1 hPa" en §15.6.
-  El programa decide según la magnitud del valor (ver `sensor.pressure_to_hpa`).
-  Compruebe que `info` muestra un valor razonable, alrededor de 1000 hPa.
+- Unidad de `IO_PRESSURE`: el manual dice hPa en §15.2 p. 44 y 0,1 hPa en §15.6
+  p. 49. La heurística de `sensor.pressure_to_hpa` no valida su significado;
+  en el firmware antiguo, los registros 16–17 pueden representar otra cosa.
+  Tampoco debe interpretarse humedad sin confirmar el mapa.
 - El PMU485 está pensado como herramienta de instalación y servicio, no para
   medir de forma permanente [2]. Además, el manual pide que el conversor RS-485
   tenga aislamiento galvánico, porque las fuentes de los portátiles generan

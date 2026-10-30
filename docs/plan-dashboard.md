@@ -1,177 +1,192 @@
-# Plan: dashboard en tiempo real
+# Plan del dashboard: SQLite + FastAPI + SvelteKit
 
-Propuesta, sin implementar. Describe qué mostraría un dashboard en vivo de las
-pruebas, cómo se conectaría al programa actual sin ponerlo en riesgo y en qué
-orden construirlo.
+**Propuesta revisada, sin implementar.** El programa actual escribe CSV y JSON.
+Esta revisión sustituye la propuesta de leer CSV en vivo y usar HTML/JS sin
+framework. La BD, API y frontend descritos aquí aún no existen en el código.
 
-## ¿Es posible? ¿Es recomendable?
+## 1. Objetivo y responsabilidades
 
-**Sí a las dos, con una condición: el dashboard sirve para vigilar la prueba,
-no para analizarla.** El análisis se sigue haciendo con los CSV guardados, que
-son la única fuente de verdad.
+Vigilar pruebas y consultar históricos desde una mini-PC Windows. Se acepta
+refrescar cada segundo; objetivo inicial de latencia desde lectura hasta pantalla:
+hasta 2 s en funcionamiento normal, a medir en el equipo real. No hay garantía
+de plazos propia de un sistema de tiempo real estricto.
 
-Durante una prueba de radiometría, mirar los datos en vivo sirve para darse
-cuenta a tiempo de cosas que después no tienen arreglo:
-
-- Un sensor dejó de responder o activó un flag que invalida el dato.
-- Los dos piranómetros empiezan a separarse (suciedad, sombra, desnivel, cable).
-- La verificación del pirgeómetro (Ld↓ frente a neta + σT⁴) no cuadra.
-- Cambian las condiciones (nubes, lámpara, alguien delante del sensor) y hay que
-  anotarlo. La [prueba 01](prueba-01.md) ya pedía "anotar las condiciones de
-  cada prueba".
-
-Hay dos restricciones técnicas que mandan sobre todo el diseño:
-
-1. **Un solo maestro Modbus.** El dashboard no puede leer el bus RS-485. Si lo
-   hiciera, habría dos programas peleando por el puerto COM (D11). Tiene que
-   consumir los datos que ya produce el comando `log`.
-2. **El dashboard no puede tumbar la adquisición.** Si se cuelga, se cierra el
-   navegador o se reinicia el servidor del dashboard, `log` tiene que seguir
-   guardando datos sin enterarse.
-
-## Qué mostrar
-
-### Barra de estado (arriba, siempre visible)
-
-| Elemento | Contenido | Por qué |
-|---|---|---|
-| Prueba | Etiqueta, hora de inicio, duración y tiempo restante, carpeta de datos, `[SIMULADO]` si aplica | Saber qué se está grabando |
-| Un chip por sensor | `#2 SGR4`, `#3 SMP22x`, `#4 SMP22x`, coloreado: verde (válido), ámbar (respondió pero inválido o con flags), rojo (sin respuesta) | Ver el estado de un vistazo |
-| Última lectura | "hace 1 s"; se pone en rojo si pasan más de 5 s | Detectar que `log` se paró |
-| Bus | Ocupación %, ciclos perdidos, timeouts del último minuto, `port_errors` | Salud de la comunicación |
-
-### Tarjetas de valores actuales
-
-| Tarjeta | Fuente | Unidad |
-|---|---|---|
-| Irradiancia global #3 y #4 | `irradiance_wm2` | W/m² |
-| Diferencia #3 − #4 | calculada | W/m² y % |
-| Onda larga descendente Ld↓ #2 | `lw_down_wm2` | W/m² |
-| Radiación neta #2 | `irradiance_wm2` del SGR4 | W/m² |
-| Verificación Ld↓ − (neta + σT⁴) | calculada, como en `info` | W/m², en rojo si pasa de ±5 |
-| Minutos completos | `minute_avg.csv`, `complete` | n.º y % del total |
-
-### Gráficas
-
-| # | Gráfica | Ventana | Detalle |
-|---|---|---|---|
-| 1 | Irradiancia global #3 y #4 a 1 s, con los promedios de 1 min como puntos | Últimos 15 min (ampliable a toda la prueba) | La misma que `irradiancia.png`, pero en vivo |
-| 2 | Diferencia relativa #3 vs #4, en % | Últimos 15 min | Es la gráfica clave de una intercomparación. Banda gris en ±2 % como referencia visual |
-| 3 | Ld↓ #2 a 1 s y neta + σT⁴ en discontinua | Últimos 15 min | Deben superponerse. Si se separan, el mapa de registros no es el esperado |
-| 4 | Temperatura del cuerpo de los 3 sensores | Toda la prueba | Tras encender, la temperatura tarda hasta 3 h en estabilizarse (D13) |
-| 5 | RTT por lectura y timeouts | Últimos 15 min | Como `comunicacion.png` |
-| 6 | Tensión de alimentación | Toda la prueba | Baja si el PMU485 no da corriente suficiente |
-
-Opcional cuando se conozcan latitud y longitud del sitio: el ángulo cenital del
-sol y la irradiancia de cielo despejado esperada (por ejemplo con la librería
-`pvlib`). Ayuda a saber si 950 W/m² a las 18:20 es sol o una lámpara.
-
-### Alertas
-
-| Alerta | Condición propuesta |
-|---|---|
-| Sensor sin respuesta | 5 fallos seguidos (el mismo umbral que el backoff de `acquisition.py`) |
-| Muestra inválida | `valid = 0` con el sensor respondiendo |
-| Piranómetros separados | \|#3 − #4\| > 2 % durante más de 1 min, con irradiancia > 100 W/m² |
-| Verificación del SGR4 | \|Ld↓ − (neta + σT⁴)\| > 5 W/m² |
-| Alimentación baja | `supply_v` < 10 V |
-| Puerto perdido | `port_errors` sube |
-| `log` parado | Sin filas nuevas durante 5 s |
-
-Los umbrales son una propuesta; hay que acordarlos con quien dirige la prueba.
-
-### Anotaciones
-
-Un campo de texto y unos botones rápidos ("limpieza de cúpula", "nube",
-"lámpara encendida", "sombra") que guardan `annotations.csv` en la carpeta de la
-prueba con la hora. Las gráficas de `plot` pueden dibujarlas después como
-líneas verticales. Es la forma más barata de cumplir lo de "anotar las
-condiciones".
-
-## Arquitectura propuesta
-
-La idea es que **los archivos que ya escribe `log` sean la interfaz** entre la
-adquisición y el dashboard. `log` ya hace `flush` de `raw_1s.csv` en cada
-ciclo, así que el dato está en disco con ~1 s de retraso.
+- Solo la adquisición abre COM y consulta Modbus, en serie.
+- Cerrar o reiniciar el dashboard no debe interrumpir la adquisición.
+- El navegador consulta la API. No abre SQLite ni escribe mediciones.
+- Primera versión de lectura. Anotaciones y controles quedan para una ampliación.
+- Funcionamiento local y sin internet tras instalar paquetes y assets.
 
 ```mermaid
 flowchart LR
-  subgraph acq["Proceso 1: python -m smp22x log (sin cambios de fondo)"]
-    loop["Bucle de adquisición"]
+  sensors["SGR4 #2 y SMP22x #3/#4"] -->|"Modbus"| acq
+  subgraph p1["Proceso de adquisición Python"]
+    acq["Lecturas, conversión y calidad"] --> writer["Escritor de almacenamiento"]
   end
-  subgraph files["Carpeta de la prueba"]
-    raw[("raw_1s.csv")]
-    minute[("minute_avg.csv")]
-    status[("status.json<br/>(nuevo, cada ciclo)")]
-    notes[("annotations.csv<br/>(nuevo)")]
+  writer -->|"transacciones breves"| db[("SQLite local con WAL")]
+  subgraph p2["Proceso web Python"]
+    reader["Consultas cortas de solo lectura"] --> api["FastAPI: HTTP + SSE"]
   end
-  subgraph dash["Proceso 2: python -m smp22x dashboard (nuevo)"]
-    tail["Lector incremental<br/>(lee solo las filas nuevas)"]
-    api["Servidor local<br/>FastAPI + SSE"]
-  end
-  browser["Navegador en el mismo PC<br/>http://127.0.0.1:8050"]
-
-  loop -->|"escribe y flush"| raw
-  loop --> minute
-  loop -->|"reemplazo atómico"| status
-  tail -->|"lee"| raw
-  tail --> minute
-  tail --> status
-  api --> tail
-  api -->|"eventos SSE cada 1 s"| browser
-  browser -->|"POST anotación"| api
-  api -->|"añade fila"| notes
+  db --> reader
+  api -->|"JSON y eventos"| browser["SvelteKit estático en navegador"]
+  browser -->|"GET: filtros e histórico"| api
+  db --> export["Exportación CSV y gráficas offline"]
 ```
 
-Por qué así:
+**Añadir FastAPI** aporta endpoints de histórico, estado y novedades, validación
+y documentación OpenAPI. La lógica científica sigue en módulos Python reutilizables.
+Modbus no se inicia en el arranque de FastAPI: reinicios o varios workers web
+podrían abrirlo más de una vez. Las llamadas bloqueantes a SQLite se ejecutarán
+sin bloquear el bucle de eventos del servidor.
 
-- **Aislamiento total.** Son dos procesos. El dashboard solo lee archivos y no
-  toca el puerto COM. Si se cae, `log` ni se entera.
-- **El dashboard puede arrancar y parar cuando quiera.** Al arrancar busca la
-  carpeta más reciente en `data/` y carga lo que ya hay.
-- **Lo que se ve en vivo es exactamente lo que se guarda.** No hay un segundo
-  camino de datos que pueda diferir de los CSV.
-- **Cambios mínimos en `log`:** solo escribir `status.json` (estado por sensor,
-  contadores, último ciclo) con un reemplazo atómico (`os.replace`), para que el
-  dashboard no lea un archivo a medio escribir.
+SvelteKit aporta rutas y layouts para vivo e históricos. Se compila mediante
+`adapter-static` y consume la API como aplicación cliente. FastAPI sirve el build
+y `/api` en el mismo origen. Node se necesita para construir, no como proceso
+de producción en la mini-PC. Ese despliegue no admite funciones de servidor de
+SvelteKit; las rutas deben funcionar al abrirse directamente. El peso final se
+medirá, incluyendo gráficas y assets, sin suponer que toda configuración sea gratis.
 
-Tecnología:
+## 2. SQLite y concurrencia
 
-| Pieza | Elección | Alternativa |
+Tres muestras por segundo equivalen a unas 259200 filas/día funcionando 24 h.
+La capacidad se verificará con el esquema real. SQLite está embebido en Python:
+no requiere servicio de BD ni contenedor.
+
+Configuración propuesta: WAL, un escritor de mediciones, conexiones independientes
+para lectores, transacciones pequeñas y timeout de bloqueo acotado. El escritor
+confirma conjuntamente las muestras obtenidas en cada ciclo, incluidas las fallidas.
+Los lectores ven los datos después del commit.
+
+**El intervalo de 1 s es de refresco, no de exclusión mutua.** WAL permite leer
+una instantánea mientras se escribe. No se mantiene una transacción abierta
+durante toda una conexión SSE o mientras se inspecciona una gráfica. Se limita
+cada consulta y se mide duración de commit, retraso de escritura y tamaño del WAL.
+
+La base estará en disco local, fuera de carpetas de red o sincronización activa.
+Los backups usarán la API de respaldo de SQLite: copiar solo un `.db` abierto
+puede omitir cambios que aún están en el WAL. Se propone `synchronous=FULL`, a
+validar midiendo commits en Windows. El `flush` de CSV actual tampoco garantiza
+por sí solo persistencia ante pérdida de energía; durabilidad y refresco son distintos.
+
+Se medirá primero una escritura por ciclo. Si afecta al muestreo, un escritor
+dedicado podrá consumir una cola **acotada**, indicando por separado datos adquiridos
+y confirmados. Ante disco lleno, E/S fallida o bloqueo persistente debe registrarse
+el fallo y detener la corrida con error si no puede persistirse. No se descartan
+muestras silenciosamente ni se publica éxito sin confirmación.
+
+### Esquema orientativo
+
+| Tabla | Contenido | Claves y reglas |
 |---|---|---|
-| Servidor | **FastAPI** con Server-Sent Events. SSE basta porque los datos solo van del servidor al navegador | Streamlit: menos código, pero menos control del refresco y del diseño |
-| Gráficas | **uPlot**: muy ligera y pensada para series temporales con miles de puntos | Plotly.js: más pesada, más funciones |
-| Frontend | Una página HTML con JS sin build. La librería se guarda en el repo, porque el PC del laboratorio puede no tener internet | — |
-| Red | Escucha solo en `127.0.0.1`. Nada sale del PC | — |
+| `runs` | Etiqueta, inicio/fin UTC, configuración, estado, simulación y versión del software | `run_id`; motivo de cierre y detección de corrida interrumpida |
+| `run_sensors` | Dirección, tipo configurado, serie, modelo de datos, firmware y perfil de conversión | `(run_id, address)`; la dirección sola no identifica permanentemente al instrumento |
+| `samples` | Hora UTC, ciclo, valores físicos, factor, estado, error, RTT y palabras originales | ID creciente; unicidad `(run_id, cycle, address)`; índice `(run_id, address, time_utc)` |
+| `minute_aggregates` | Magnitud identificada, media, mínimo/máximo, desviación, recuentos y cobertura | `(run_id, address, minute_utc)`; reconstruible desde muestras |
+| `acquisition_status` | Heartbeat del proceso, último ciclo y commit, contadores y desconexiones | Distinguir ausencia de lectura de proceso detenido |
 
-Descartado por ahora: **InfluxDB/TimescaleDB + Grafana**. Es el estándar para
-una estación de medida permanente, pero para pruebas de 30 min a unas horas
-añade una base de datos, un servicio y su mantenimiento sin ganar nada. Tiene
-sentido en la fase 2, si esto pasa a medir de forma continua.
+La hora puede almacenarse como entero de microsegundos desde epoch; la API entrega
+ISO 8601 con zona UTC. La primera migración fijará esa representación. Se usarán
+nombres físicos separados para onda corta, neta de onda larga y Ld↓, evitando
+heredar la ambigüedad de `irradiance_wm2` del CSV SGR4.
 
-## Plan de implementación
+Se conservarán enteros originales, factor y versión de conversión para permitir
+revisiones del mapa (ver [guía de registros](lectura-registros.md)). `NULL` es
+ausente; cero es un valor. Los inválidos permanecen con sus motivos, aunque se
+excluyan de promedios. El esquema se versionará y los simulados se identificarán.
 
-| Paso | Qué se hace | Terminado cuando |
+Para nuevas corridas SQLite será la fuente de verdad y CSV una exportación.
+La transición incluye lectura de pruebas antiguas, exportación compatible y
+comparación de valores. Escribir BD y CSV por separado no constituye una
+transacción atómica conjunta.
+
+## 3. Actualización del navegador
+
+| Mecanismo | Funcionamiento | Uso propuesto |
 |---|---|---|
-| 0 | Acordar con quien dirige la prueba qué decide mirando el dashboard, los umbrales de alerta y la ventana de tiempo | Tabla de alertas con valores firmados |
-| 1 | `log` escribe `status.json` en cada ciclo con reemplazo atómico | Test que lee `status.json` mientras corre `log --simulate` y nunca encuentra JSON roto |
-| 2 | Lector incremental de CSV: guarda la posición del archivo, lee solo las filas nuevas y detecta una carpeta de prueba nueva | Tests con un CSV que crece y con un cambio de carpeta |
-| 3 | Lógica de alertas en Python, en un módulo propio, reutilizando `Sample.valid` y `lw_down_calc` | Tests unitarios por alerta |
-| 4 | Comando `python -m smp22x dashboard`: FastAPI con `/api/run` (metadatos), `/api/history` (carga inicial), `/api/stream` (SSE) y `/api/annotations` | Responde con `log --simulate` corriendo en otra terminal |
-| 5 | Página: barra de estado, tarjetas, 6 gráficas con uPlot, alertas y anotaciones | Se ve bien en el portátil del laboratorio; refresco ≤ 2 s |
-| 6 | `plot` dibuja las anotaciones en las PNG | `irradiancia.png` y `onda_larga.png` muestran las líneas |
-| 7 | Prueba larga simulada (2 h) y luego una con hardware | Sin crecimiento de memoria ni CPU apreciable; `log` no pierde ciclos |
-| 8 | README y decisiones técnicas | Sección "Dashboard" en el README y una decisión D16 |
+| GET periódico | El navegador pide novedades cada segundo | Primera versión para validar el flujo |
+| SSE | HTTP persistente, novedades API → navegador | Evolución prevista para vivo, con reconexión por cursor |
+| WebSocket | Canal bidireccional navegador/API | Si aparece una necesidad bidireccional que lo justifique |
 
-Dependencias nuevas: `fastapi` y `uvicorn` (servidor) y `uPlot` (archivo JS en
-el repo). Esfuerzo estimado: 3 a 5 días de trabajo.
+FastAPI soporta WebSockets, pero estos no consultan SQLite automáticamente. Tanto
+SSE como WebSocket necesitan que el backend consulte filas confirmadas o reciba
+notificaciones del escritor. Una consulta incremental cada segundo basta de inicio.
+SSE reduce peticiones repetidas del navegador; no garantiza menor latencia que
+GET a la misma frecuencia.
 
-## Fase 2, si pasa a estación permanente
+Endpoints previstos: `GET /api/runs`, `/api/runs/{id}`, `/api/runs/{id}/samples`,
+`/api/runs/{id}/status` y después `/api/runs/{id}/stream`. Histórico con sensor,
+intervalo UTC, cursor y límite. El cursor es un ID creciente de inserción, no solo
+una hora. Carga inicial y reconexión comparten ese cursor; el frontend deduplica
+por ID. Se fija un límite de histórico inicial y se recuperan los IDs posteriores
+para cubrir lo insertado durante esa carga.
 
-- `log` como servicio de Windows que arranca solo y escribe archivos por día.
-- Base de datos de series temporales (InfluxDB o TimescaleDB) y Grafana para
-  históricos y alertas por correo.
-- Reloj sincronizado por NTP, porque las marcas de tiempo del PC son las del
-  dato (el sensor no tiene reloj).
-- Conversor RS-485 aislado y fuente de 12 V en lugar del PMU485, que el
-  fabricante plantea como herramienta de instalación (README §6).
+Un lector de novedades por corrida puede alimentar a varios clientes. Se envían
+solo datos confirmados. Ante un cliente lento se corta y resincroniza; no se
+acumula memoria sin límite. Las gráficas limitan sus puntos y para históricos
+largos piden agregaciones que incluyan mínimo y máximo, evitando ocultar picos.
+
+## 4. Qué verá el investigador
+
+| Vista | Datos | Interpretación |
+|---|---|---|
+| Estado | Corrida, simulación, última respuesta por sensor, último commit y refresco, fallos del puerto | Separar sensor, almacenamiento y conexión web |
+| Tabla actual | #3/#4 onda corta; #2 Ld↓ y neta; unidad, hora, edad, modo, flags y validez | No presentar una lectura antigua como actual |
+| Comparación #3/#4 | Diferencia absoluta y relativa, pareja válida del mismo ciclo | `% = 100 × (E3−E4)/((E3+E4)/2)`; ocultar porcentaje cerca de cero |
+| SGR4 | Ld↓ leído, neta + σT⁴ y diferencia | Consistencia interna, no calibración independiente |
+| Temperatura | Cuerpo de cada sensor | No es temperatura ambiente |
+| Comunicación | RTT, fallos por intervalo, desconexiones y retrasos de ciclo | RTT no es respuesta física del detector |
+| Alimentación | Tensión del conector | Una caída exige investigar, no identifica una causa por sí sola |
+| Calidad | Válidas/esperadas, inválidas, ausencias y cobertura por minuto | `complete=1` actual significa ≥80 % válidas, no cero pérdidas |
+
+Ventana inicial de 15 min, ampliable a histórico. Irradiancia y Ld↓ se muestran
+en paneles separados: comparten W/m² pero son magnitudes distintas. No se
+rellenan huecos ni se unen visualmente largos periodos sin datos. Humedad/presión
+no se presentarán como fiables con perfiles antiguos sin confirmar.
+
+Las comparaciones de un ciclo admiten el desfase de lecturas secuenciales. Si
+el objetivo científico exige mayor simultaneidad debe medirse y documentarse
+antes de interpretar diferencias durante cambios rápidos.
+
+Alertas propuestas: sensor sin respuesta tras 5 intentos fallidos, dato obsoleto
+según edad, desacuerdo sostenido #3/#4, inconsistencia SGR4 y error de persistencia.
+Los umbrales anteriores de 2 %, ±5 W/m² y 10 V son propuestas del proyecto,
+no límites normativos. En particular SGR §13.1 p. 29 indica alimentación 5–30 V:
+10 V no es el límite oficial de funcionamiento. Los umbrales deben justificarse
+con el objetivo de la investigación antes de activarlos.
+
+## 5. Implementación por etapas
+
+| Paso | Entregable | Criterio de aceptación |
+|---|---|---|
+| 0 | Confirmar mapa del firmware real, objetivos y especificaciones de la mini-PC | Perfil de equipos y pendientes explícitos; RAM, CPU, disco y versiones registrados |
+| 1 | Interfaz de almacenamiento, migración y escritor SQLite | Recuperar muestras, fallos y enteros originales; transacción por ciclo |
+| 2 | Lectores concurrentes, recuperación, backup y exportación | Probar reinicio abrupto, disco lleno y lectura mientras escribe; sin pérdidas silenciosas |
+| 3 | API FastAPI de lectura, cursor, heartbeat y consultas acotadas | Histórico y novedades coinciden con BD; reiniciar API no detiene adquisición |
+| 4 | SvelteKit estático, estado, tabla y gráficas | Refresco ≤2 s en condiciones normales; memoria acotada; rutas y modo offline correctos |
+| 5 | SSE si mejora el comportamiento medido | Reconectar recupera datos sin huecos ni duplicados |
+| 6 | Comparaciones y alertas con criterios acordados | Valores bajos, inválidos y ausencias no generan comparaciones engañosas |
+| 7 | Prueba sostenida simulada y con hardware en Windows | Medir CPU/RAM, p95 de commit, latencia, disco y ciclos perdidos frente a CLI sin dashboard |
+| 8 | Empaquetado e instrucciones Windows y C4 actualizado | Instalación reproducible y análisis de pruebas antiguas conservado |
+
+No se fija un presupuesto CPU/RAM antes de conocer el equipo. Se comprobará
+que el dashboard no añade pérdidas de ciclos frente a la adquisición sola.
+Las anotaciones futuras llegarían mediante POST a la API como datos de usuario;
+entonces se decidirá su almacenamiento y coordinación con el escritor.
+
+## 6. SQLite frente a un servidor de series temporales
+
+SQLite reduce servicios y despliegue. InfluxDB se reconsiderará si crecen equipos,
+consultas o necesidades de retención; medir continuamente no obliga por sí solo
+a migrar. **InfluxDB 3 Core ofrece binario Windows AMD64**, por lo que Docker no
+es obligatorio para esa edición. Deben evaluarse versión, funcionalidades y coste
+real de recursos. Docker Desktop para contenedores Linux utiliza virtualización,
+habitualmente WSL2, que añade consumo y administración.
+
+Fuentes oficiales de esta propuesta:
+
+- [SQLite WAL](https://sqlite.org/wal.html): concurrencia, un escritor y restricciones de almacenamiento.
+- [SQLite Online Backup](https://sqlite.org/backup.html): respaldo consistente de una base abierta.
+- [FastAPI WebSockets](https://fastapi.tiangolo.com/advanced/websockets/): canal navegador/API.
+- [SvelteKit adapter-static](https://svelte.dev/docs/kit/adapter-static) y [SPA](https://svelte.dev/docs/kit/single-page-apps): build estático y rutas cliente.
+- [InfluxDB 3 Core](https://docs.influxdata.com/influxdb3/core/install/): plataformas y binario Windows.
+- [Docker Desktop Windows](https://docs.docker.com/desktop/setup/install/windows-install/): virtualización y requisitos.

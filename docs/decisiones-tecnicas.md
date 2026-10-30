@@ -2,6 +2,11 @@
 
 Cada decisión indica el documento y la sección exacta que la justifica.
 
+Este archivo explica el **código actual**. Para aprender las conversiones use
+primero la [guía de registros](lectura-registros.md), con tablas explicativas y
+páginas verificadas. La futura arquitectura SQLite/FastAPI/SvelteKit está en el
+[plan del dashboard](plan-dashboard.md); aún no está implementada.
+
 **Documentos citados**
 
 | Clave | Documento |
@@ -48,6 +53,11 @@ Cada decisión indica el documento y la sección exacta que la justifica.
 
 ## D4. Mapa de registros leídos
 
+Referencia detallada: [guía de registros, tabla periódica](lectura-registros.md#4-tabla-de-lectura-periódica).
+Las direcciones y tipos se verificaron en [MAN] §15.2 pp. 43–45; las
+conversiones, en §15.6 pp. 47–49. La página impresa coincide con la del PDF.
+Son direcciones PDU base cero, distintas de las direcciones de equipo 2, 3 y 4.
+
 Cada ciclo hace una sola transacción FC04 por sensor: 8 registros (2 a 9) en los piranómetros y 10 registros (2 a 11) en el pirgeómetro.
 
 | Reg. | Nombre | Conversión | Fuente [MAN] |
@@ -63,7 +73,7 @@ Cada ciclo hace una sola transacción FC04 por sensor: 8 registros (2 a 9) en lo
 | 10 | IO_SENSOR2_DATA | S16 ÷ escala → W/m². Solo SGR: Ld↓ compensado | §15.2, §15.6 (registro 4) |
 | 11 | IO_RAW_SENSOR2_DATA | S16 ÷ escala → W/m². Solo SGR: Ld↓ | §15.2 |
 
-Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (IO_RH e IO_PRESSURE), según [MAN] §15.2 y §15.6.
+Cada 60 s se hace además una lectura de los registros 16 y 17 (IO_RH e IO_PRESSURE), según [MAN] §15.2 p. 44 y §15.6 p. 49. Su interpretación no está validada para los equipos antiguos (D12).
 
 - **Por qué el bloque 2–9:** es el mismo bloque que lee el programa de ejemplo en C ([MAN] §15.11, `SendModbusRequest (0x04, 2, IO_OPERATIONAL_MODE, 4)`), ampliado hasta el registro 9. Así basta una transacción por sensor.
 - **Por qué no los registros flotantes 10000+:** existen ([MAN] §15.2, "Real time floating data points"), pero el manual no indica el orden de las palabras de 16 bits dentro de cada valor F32. Además, [MAN2015] Apéndice A no los incluye, así que un sensor con firmware antiguo podría no tenerlos. Ver D12.
@@ -73,14 +83,14 @@ Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (
 ## D5. Aplicación del factor de escala
 
 - **Decisión:** aplicar el factor con una tabla: 2 → ÷100, 1 → ÷10, 0 → ×1, −1 → ×10. Un valor que no esté en la tabla se marca como error.
-- **Fuente:** [MAN] §15.6, registro 4, tabla "Scale factor / Calculation".
+- **Fuente:** [MAN] §15.6 p. 48, registro 4, tabla "Scale factor / Calculation". Se interpreta primero el signo S16; la escala solo afecta a 5, 6, 10 y 11. Las escalas de 7, 8 y 9 son fijas.
 - **Nota:** el `switch` de [MAN] §15.11 no tiene ningún `break`. Tal como está escrito, siempre acaba en `default: fSensorData = 0.0`, por eso no se copió.
 - **Código:** `sensor.scale_sensor_value`.
 
 ## D6. Unidad de IO_PRESSURE
 
 - **Decisión:** si el valor bruto es mayor que 2000, se interpreta en 0,1 hPa. Si no, en hPa.
-- **Fuente de la ambigüedad:** [MAN] §15.2 dice "Internal pressure of the sensor in hPa". [MAN] §15.6 (registro 17) dice "in 0.1 hPa" y da la fórmula ÷10.
+- **Fuente de la ambigüedad:** [MAN] §15.2 p. 44 dice hPa; §15.6 p. 49 (registro 17) dice 0,1 hPa y da ÷10. El umbral es una heurística del proyecto y no garantiza compatibilidad. La fila de humedad de p. 49 también tiene una unidad inconsistente con p. 44. Ver guía, sección 5.
 - **Código:** `sensor.pressure_to_hpa`.
 
 ## D7. Criterio de validez de una muestra
@@ -155,7 +165,7 @@ Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (
   - [MAN] §15.6 (registro 0) solo documenta los códigos 635 (SMP10x) y 636 (SMP22x). En el registro 1 exige un data model ≥ 108.
   - [MAN2015] Apéndice A (registros 0 y 1) es válido para los data models 100 y 101. Solo lista los códigos 601 (CMP 3) y 603 (CMP 11).
   - Ninguno de los dos documentos define los códigos 607 ni 611.
-- **Por qué los datos leídos son válidos:** los registros 2–9 y sus escalas son idénticos en [MAN2015] Apéndice A ("Real-time processed data") y en [MAN] §15.2. Lo único que cambia es el nombre del modelo.
+- **Evidencia de compatibilidad parcial:** las tablas citadas describen el bloque 2–9 y sus escalas. Eso respalda su interpretación, pero no demuestra que solo cambie el nombre del modelo ni valida todos los registros del firmware real. `valid=1` es una decisión del software, no una certificación de compatibilidad.
 - **Decisión:** mantener el aviso, pero no bloquear la adquisición. **No se usan los registros 10000+ ni los 16–17 como fuente de datos principal**, porque [MAN2015] Apéndice A asigna los registros 16–17 a IO_DAC_OUTPUT_VOLTAGE e IO_SELECTED_DAC_INPUT. En estos sensores, por tanto, las columnas `rh_pct` y `pressure_hpa` **no deben interpretarse**.
 - **Actualización:** el sensor #2 es un pirgeómetro SGR4, no un SMP22x (ver D15). Por eso el programa asocia el código 611 al SGR4 y el 607 al SMP22x (`registers.OBSERVED_DEVICE_TYPES`), y avisa en cada identificación de que esos códigos no están en [MAN].
 - **Pendiente:** confirmar con OTT HydroMet los códigos 607 y 611. Hay que dar lote y serie: 240466, 240349 y 240350 ([MAN] §12.1).
@@ -181,11 +191,13 @@ Cada 60 s se hace además una lectura de diagnóstico de los registros 16 y 17 (
   - Registro 11, IO_RAW_SENSOR2_DATA: "Long wave down radiation in W/m2 (only for SGR)".
   - [MAN] §15.6, registro 4: el factor de escala se aplica también a IO_SENSOR2_DATA e IO_RAW_SENSOR2_DATA.
 - **Física:** [SGR] §7.1.5 da Ld = Uemf/S + 5,67·10⁻⁸·Tb⁴. Uemf/S es la radiación neta entre el cielo y el detector y Tb la temperatura del cuerpo en K. La neta "is mostly negative", porque el cielo suele estar más frío que el sensor. [SGRDS] lo resume: "if the sky is colder than the pyrgeometer, … the output is negative".
-- **Esto explica la prueba 01.** El valor "anómalo" de −160 a −163 W/m² del sensor #2 ([prueba 01](prueba-01.md)) era la radiación neta del SGR4, leída del registro 5 como si fuera irradiancia. Es un valor normal para un pirgeómetro con cielo despejado.
+- **Interpretación de la prueba 01.** El valor de −160 a −163 W/m² del sensor #2 ([prueba 01](prueba-01.md)) es compatible con radiación neta de un SGR4. Identificarlo como pirgeómetro explica por qué no debe compararse con la irradiancia de #3/#4; el valor solo no demuestra cielo despejado ni confirma todo el mapa del firmware.
 - **Decisión:**
   - Configurar por dirección qué sensores son pirgeómetros (`--pyrgeometers`, por defecto `2`), en lugar de deducirlo del IO_DEVICE_TYPE, porque el código 611 no está documentado. Si el código y la configuración no cuadran, `read_info` avisa.
   - En el pirgeómetro, leer los registros 2–11 en una sola transacción y tomar **Ld↓ (registro 10) como magnitud principal**: es la que se promedia por minuto y se grafica. La neta (registro 5) se guarda también.
   - Mostrar en `info`, en `onda_larga.png` y en `resumen.csv` la verificación Ld↓ − (neta + σT⁴). Debe quedar dentro de ±5 W/m² (`sensor.LW_CHECK_TOLERANCE_WM2`), que cubre la resolución de 1 W/m² con escala 0 y la de 0,1 °C de la temperatura (≈ 0,6 W/m²).
   - Graficar el pirgeómetro aparte de los piranómetros y sacarlo de la "media de los sensores": mide otra magnitud.
-- **Riesgo pendiente:** el SGR4 de la prueba 01 tiene data model 102 y [MAN] describe el 108. No se ha podido confirmar que los registros 10–11 existan con ese significado en el 102. Si la verificación falla en el hardware, la alternativa es calcular Ld↓ con la fórmula de [SGR] §7.1.5 a partir de la neta y la temperatura, que sí se leen en el bloque 2–9.
+- **Páginas verificadas:** [MAN] §15.2 p. 43 (registros 5 y 10), p. 44 (11); §15.6 p. 48 (escala). [SGR] §7.1.5 p. 17 (fórmula), §8.1 p. 24 (serie), §13.1 p. 29 (prestaciones).
+- **Umbral y límites:** ±5 W/m² es una tolerancia elegida por el proyecto, no una especificación de calibración del fabricante. La coincidencia es consistencia interna; ambas vías usan datos del instrumento. Hoy no modifica `Sample.valid`.
+- **Riesgo pendiente:** el SGR4 de la prueba 01 tiene data model 102 y [MAN] describe el 108. No se ha confirmado 10–11 con ese significado en el 102. Calcular Ld↓ desde neta y temperatura sería una alternativa que también requiere validar el perfil y etiquetar el resultado como calculado; no se activa automáticamente en el código actual.
 - **Código:** `registers.py` (`IO_SENSOR2_DATA`, `PYRGEOMETER_BLOCK_COUNT`, `OBSERVED_DEVICE_TYPES`), `sensor.py` (`Sample.measurement`, `Sample.lw_down_calc`), `cli.py` (`--pyrgeometers`), `plotting.py` (`_plot_longwave`).
