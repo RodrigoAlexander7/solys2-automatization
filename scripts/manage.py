@@ -21,6 +21,7 @@ def main():
     elif command == "env":
         if not (ROOT / ".env").exists():
             shutil.copyfile(ROOT / ".env.example", ROOT / ".env")
+        (ROOT / "data").mkdir(exist_ok=True)
         print(".env listo; no se sobrescribe configuración existente.")
     else:
         children = []

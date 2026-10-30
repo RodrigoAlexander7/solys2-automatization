@@ -32,9 +32,9 @@ run: build
 	$(VENV_PYTHON) scripts/manage.py run
 docker-build:
 	docker compose build
-docker-up:
+docker-up: env
 	docker compose up -d --build
-docker-web:
+docker-web: env
 	docker compose up -d --build web
 docker-down:
 	docker compose down
