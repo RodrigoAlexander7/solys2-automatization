@@ -4,8 +4,9 @@ Cada decisión indica el documento y la sección exacta que la justifica.
 
 Este archivo explica el **código actual**. Para aprender las conversiones use
 primero la [guía de registros](lectura-registros.md), con tablas explicativas y
-páginas verificadas. La futura arquitectura SQLite/FastAPI/SvelteKit está en el
-[plan del dashboard](plan-dashboard.md); aún no está implementada.
+páginas verificadas. La arquitectura SQLite/FastAPI/SvelteKit está implementada;
+su operación está en [operacion-dashboard.md](operacion-dashboard.md) y su
+trazabilidad en [SDD](sdd/tasks.md).
 
 **Documentos citados**
 
@@ -177,10 +178,12 @@ Cada 60 s se hace además una lectura de los registros 16 y 17 (IO_RH e IO_PRESS
 
 ## D14. Formato de almacenamiento
 
-- **Decisión:** guardar los datos en CSV largo (una fila por sensor y ciclo), un CSV con promedios de 1 minuto y un `run.json` con los metadatos.
+- **Decisión actualizada:** SQLite WAL como fuente de verdad, con commit por ciclo y escritor único. Conservar CSV largo, promedios y `run.json` como proyecciones compatibles posteriores al commit; pueden regenerarse con `export`. No son una transacción atómica conjunta con SQLite.
 - **Fuente:** [MAN] §9.1: "The instrument has no internal data memory". El PC es el único registro de los datos, así que el CSV se vacía a disco en cada ciclo.
 - **Datos incluidos en `run.json`:** [MAN] §12.1 pide, para cualquier soporte técnico, el modelo, el número de serie, archivos de datos de ejemplo y el sistema de adquisición.
 - **Estadísticas de comunicación:** `comm_errors = requests − responses_ok` cuenta solo fallos del sensor (timeout, CRC, excepción Modbus). Una desconexión del USB va aparte, en `port_errors` y `port_downtime_s`, y no cuenta como petición. El ciclo cortado por la desconexión no entra en `cycle_ms_*` ni en la ocupación del bus, y los ciclos que no se hicieron mientras faltaba el puerto no cuentan como `overruns`.
+
+- **Durabilidad:** `flush` vacía buffers Python; no garantiza persistencia ante corte de energía. SQLite usa `synchronous=FULL`; backup mediante la API SQLite, no copiando solo el `.db` activo. Las palabras U16 y el factor se conservan ahora en BD, sin prometer recuperarlos de CSV antiguos.
 
 ## D15. Sensor #2: pirgeómetro SGR4
 

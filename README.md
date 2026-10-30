@@ -9,7 +9,38 @@ un **PMU485 Smart Setup Hub** (0382460) enchufado por USB al PC:
 | **3** | Piranómetro **SMP22x** (0374960) | Irradiancia global de onda corta, W/m² |
 | **4** | Piranómetro **SMP22x** (0374960) | Irradiancia global de onda corta, W/m² |
 
-El software guarda los datos en CSV y genera las gráficas de la prueba.
+La adquisición Python guarda las muestras en **SQLite** y produce CSV/PNG
+compatibles. Otro proceso **FastAPI** consulta SQLite y sirve el dashboard
+**SvelteKit**, instalado y compilado con **Bun**. Cerrar la web no detiene las
+mediciones. La UI es de solo lectura.
+
+## Arranque del dashboard
+
+Requisitos: Python 3.13, Bun 1.4 y, opcionalmente, Make o Docker.
+
+```sh
+make install
+make run
+```
+
+Abrir http://127.0.0.1:8050. `make install` copia `.env.example` a `.env` sin
+sobrescribirlo; la plantilla usa sensores **simulados**. Para hardware, cambiar
+`SMP_SIMULATE=0` y configurar el puerto. Con Docker: `make docker-up` (todo
+simulado), `make docker-web` (solo web con adquisición nativa). Las instrucciones
+para Windows sin Make están en [operación](docs/operacion-dashboard.md).
+
+La [especificación SDD](docs/sdd/spec.md), su [diseño](docs/sdd/design.md) y la
+[evidencia de tests](docs/sdd/tasks.md) describen requisitos, casos límite y
+validación. `make check` y `make test` ejecutan verificaciones de frontend/backend.
+
+### Qué se hace con la medida
+
+Se interpretan signo y escalas de los enteros según el manual para convertirlos
+a W/m², °C o V. **La medida principal se expresa como la entrega el sensor en
+esas unidades, sin una corrección adicional del programa.** Se guardan también
+palabras originales en SQLite. Por separado se calculan promedios, diferencias
+y la comprobación SGR `neta + σT⁴`, que nunca sustituye a Ld↓ leído. Véase el
+[tratamiento de datos](docs/tratamiento-datos.md).
 
 Documentación oficial en [`references/`](references/):
 
@@ -63,7 +94,7 @@ El SMP22x y el SGR4 usan el mismo código de colores (§7.3.5; manual SGR4 §7.2
 - **No abra SmartExplorer al mismo tiempo que este programa.** El puerto COM
   solo lo puede usar un programa a la vez, y un bus Modbus admite un único maestro.
 
-## 2. Instalación
+## 2. Instalación de la CLI
 
 ```bash
 python -m venv .venv
@@ -123,7 +154,9 @@ hardware: un SGR4 en la dirección 2 y dos SMP22x en la 3 y la 4. Solo responden
 a 19200 8E1, como los reales de fábrica. Sirve para probar el programa. Las
 carpetas simuladas terminan en `_SIM` y las gráficas lo indican.
 
-Tests: `.venv\Scripts\python -m unittest discover -s tests`
+Tests backend: `.venv\Scripts\python -m unittest discover -s tests` tras instalar
+`requirements-dev.txt`. Frontend: `bun run --cwd frontend check` y
+`bun run --cwd frontend test`.
 
 ## 4. ¿Cada cuánto leer?
 
@@ -203,6 +236,12 @@ Por qué el ciclo es robusto:
 
 Por cada prueba se crea `data/<fecha>_<hora>[_etiqueta]/` con:
 
+La CLI usa además `data/acquisition.sqlite3` por defecto (`--db` o `SMP_DB_PATH`).
+Contiene corridas, muestras originales y convertidas, identificación, estado y
+errores. El commit de ciclo precede a la escritura de las proyecciones CSV.
+Se puede regenerar una carpeta CSV con `python -m smp22x export RUN_ID --out
+data/exportacion`. No copiar solo el archivo `.db` abierto: usar `backup`.
+
 - **`raw_1s.csv`**: una fila por sensor y ciclo. Columnas:
   - `time_utc` y `time_local`: marca de tiempo.
   - `cycle`: agrupa lecturas secuenciales; no indica simultaneidad.
@@ -212,8 +251,8 @@ Por cada prueba se crea `data/<fecha>_<hora>[_etiqueta]/` con:
     global compensada en temperatura. **En el pirgeómetro es la radiación neta
     del detector**, normalmente negativa (§15.2).
   - `raw_irradiance_wm2`: `IO_RAW_SENSOR1_DATA`, ya convertido a W/m²; no son
-    enteros originales del bus. Actualmente el CSV tampoco conserva el factor
-    de escala de cada lectura.
+    enteros originales del bus. El CSV no conserva factor ni palabras originales;
+    ambos sí se conservan en SQLite.
   - `lw_down_wm2` y `raw_lw_down_wm2`: solo pirgeómetro. `IO_SENSOR2_DATA` e
     `IO_RAW_SENSOR2_DATA`, radiación de onda larga descendente Ld↓.
   - `stdev_wm2`, `body_temp_c`, `supply_v`.

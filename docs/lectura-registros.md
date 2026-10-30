@@ -1,7 +1,8 @@
 # De Modbus a una medida física
 
-Describe la implementación actual. SQLite, FastAPI y SvelteKit son una propuesta
-del [plan del dashboard](plan-dashboard.md), todavía sin implementar.
+Describe la implementación actual con SQLite y el dashboard FastAPI/SvelteKit.
+Para ejecutarlo consulte [operación](operacion-dashboard.md); para conocer qué
+se calcula después de convertir, [tratamiento de datos](tratamiento-datos.md).
 
 ## 1. Dirección del equipo y dirección del registro
 
@@ -181,14 +182,14 @@ El cableado está en SGR §7.2.2.5 p. 23.
 
 ## 8. Qué se conserva para reproducir una conversión
 
-Hoy `sensor.py` convierte a `Sample`; `acquisition.py` guarda valores físicos.
+`sensor.py` convierte a `Sample`; `acquisition.py` confirma el ciclo en SQLite
+y después escribe las proyecciones CSV con valores físicos.
 `raw_irradiance_wm2` **no contiene palabras Modbus originales**. `scale_factor`
 existe en memoria pero no está en `RAW_COLUMNS`. La hora la toma el PC tras
 cada lectura; consultar en serie introduce desfase entre sensores del mismo
 `cycle`. Un ciclo no implica adquisición simultánea.
 
-Para SQLite se propone guardar también enteros originales, factor, versión de
-conversión, modelo de datos y equipo identificado. Así una revisión del manual
-permitirá recalcular valores conservando la evidencia. Todavía no está
-implementado. Las lecturas fallidas deben conservar su error y valores ausentes,
-sin reemplazar ausencias por cero ni interpolar al guardar.
+SQLite conserva `raw_registers`, factor, `conversion_version`, modelo de datos
+e identificación. Las lecturas fallidas conservan error y valores ausentes;
+no se sustituyen por cero ni se interpolan. No se pueden reconstruir las
+palabras de los CSV antiguos que nunca las guardaron.
