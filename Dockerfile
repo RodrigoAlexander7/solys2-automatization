@@ -8,7 +8,7 @@ RUN bun run check && bun run test && bun run build
 FROM python:3.13-slim AS runtime
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 SMP_API_HOST=0.0.0.0
-COPY requirements.txt ./
+COPY requirements.txt requirements.lock ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY smp22x/ ./smp22x/
 COPY --from=frontend /build/build ./frontend/build

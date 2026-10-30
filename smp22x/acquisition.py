@@ -402,6 +402,9 @@ class Acquisition:
             require(self.writer.commit_cycle(self.run_id, cycle, samples, {
                 "cycle": cycle, "cycle_ms": cycle_ms, "port_errors": self.port_errors,
                 "overruns": self.overruns, "port_downtime_s": self.port_downtime_s,
+                "per_sensor": {str(a): {"requests": s.requests, "responses_ok": s.ok,
+                    "samples_valid": s.valid, "consecutive_failures": s.consecutive_failures,
+                    "comm_errors": s.requests - s.ok} for a, s in self.state.items()},
             }))
             for sample in samples:
                 raw_w.writerow(self._row(cycle, sample))

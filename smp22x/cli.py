@@ -47,7 +47,7 @@ def _add_bus_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--baud", type=int, default=reg.DEFAULT_BAUDRATE, help="baudios (fábrica: 19200)")
     p.add_argument("--parity", default=reg.DEFAULT_PARITY, choices=["E", "N", "O"], help="paridad (fábrica: E)")
     p.add_argument("--timeout", type=float, default=0.3, help="timeout de respuesta en s (0.3)")
-    p.add_argument("--simulate", action="store_true", help="usar sensores simulados (sin hardware)")
+    p.add_argument("--simulate", action=argparse.BooleanOptionalAction, help="usar sensores simulados (sin hardware)")
 
 
 def _add_address_arg(p: argparse.ArgumentParser) -> None:
@@ -348,6 +348,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_backup)
 
     e = environment()
+    if e.get("SMP_SIMULATE", "0").lower() not in {"0", "1", "false", "true", "no", "yes"}:
+        raise ValueError("SMP_SIMULATE debe ser 0/1, false/true o no/yes")
+    if e.get("SMP_PARITY", "E") not in {"E", "N", "O"} or int(e.get("SMP_BAUD", "19200")) <= 0:
+        raise ValueError("Paridad o baudios no válidos")
     for name in ("scan", "info", "log"):
         sub.choices[name].set_defaults(port=e.get("SMP_SERIAL_PORT", "auto"),
             baud=int(e.get("SMP_BAUD", "19200")), parity=e.get("SMP_PARITY", "E"),
@@ -374,6 +378,8 @@ def main(argv: list[str] | None = None) -> int:
             def stop(signum, frame):
                 raise KeyboardInterrupt()
             signal.signal(signal.SIGTERM, stop)
+            if hasattr(signal, "SIGBREAK"):
+                signal.signal(signal.SIGBREAK, stop)
         return args.func(args)
     except PortError as exc:
         print(f"Error de puerto: {exc}", file=sys.stderr)

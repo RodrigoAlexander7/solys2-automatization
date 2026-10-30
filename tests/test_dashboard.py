@@ -3,6 +3,8 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -12,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from smp22x.acquisition import Acquisition, AcquisitionConfig
 from smp22x.api import create_app
-from smp22x.config import Settings, settings
+from smp22x.config import Settings, settings, environment
 from smp22x.metrics import comparison
 from smp22x.result import Err, Failure, Ok, require, StorageFailure
 from smp22x.sensor import Sample, SMPSensor
@@ -69,6 +71,33 @@ class StoreTests(unittest.TestCase):
         self.writer.close()
         require(self.writer.open())
         self.assertEqual(require(self.reader.run("run"))["state"], "interrupted")
+
+    def test_process_death_releases_writer_lock_and_keeps_commits(self):
+        path = self.path.parent / "child.db"
+        code = ("from pathlib import Path; from smp22x.storage import Writer; from smp22x.result import require; "
+                "import sys,time; w=Writer(Path(sys.argv[1])); require(w.open()); "
+                "require(w.start('child',{})); print('ready',flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-c", code, str(path)], stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "ready")
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+            child.stdout.close()
+        recovered = Writer(path)
+        try:
+            require(recovered.open())
+            self.assertEqual(require(Reader(path).run("child"))["state"], "interrupted")
+        finally:
+            recovered.close()
+
+    def test_recent_window_and_late_insertion(self):
+        self.insert(0, [sample(offset=30)])
+        self.insert(1, [sample(offset=-30)])
+        result = require(self.reader.samples("run", limit=1, recent=True))
+        self.assertEqual(result["items"][0]["cycle"], 1)
+        self.assertTrue(result["history_truncated"])
+        self.assertFalse(result["has_more"])
 
     def test_cursor_and_filters(self):
         self.insert(samples=[sample(3), sample(4)])
@@ -155,6 +184,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(data["items"][0]["address"], 4)
         self.assertEqual(self.client.get("/api/runs/run/stream?once=true", headers={"Last-Event-ID": "bad"}).status_code, 422)
 
+    def test_cursor_from_another_run_is_rejected(self):
+        self.insert()
+        cursor = require(self.reader.samples("run"))["next_cursor"]
+        require(self.writer.start("other", {}))
+        self.assertEqual(self.client.get(f"/api/runs/other/samples?after_id={cursor}").status_code, 422)
+        self.assertEqual(self.client.get(f"/api/runs/other/stream?once=true&after_id={cursor}").status_code, 422)
+
     def test_stale_is_distinct_from_invalid(self):
         self.insert(samples=[sample(offset=-30)])
         status = self.client.get("/api/runs/run/status").json()
@@ -207,6 +243,18 @@ class ErrorTests(unittest.TestCase):
         for env in ({"SMP_API_PORT": "0"}, {"SMP_POLL_S": "nan"}, {"SMP_STALE_S": "0"}):
             with self.assertRaises(ValueError):
                 settings(env)
+
+    def test_environment_and_cli_precedence(self):
+        from smp22x.cli import build_parser
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".env"
+            path.write_text("SMP_API_PORT=8060\n", encoding="utf-8")
+            with patch.dict("os.environ", {"SMP_API_PORT": "8062"}):
+                self.assertEqual(environment(path)["SMP_API_PORT"], "8062")
+        with patch("smp22x.cli.environment", return_value={"SMP_SIMULATE": "1", "SMP_DB_PATH": "from-env.db"}):
+            args = build_parser().parse_args(["log", "--no-simulate", "--db", "from-cli.db"])
+            self.assertFalse(args.simulate)
+            self.assertEqual(args.db, "from-cli.db")
 
     def test_storage_failure_stops_acquisition(self):
         with tempfile.TemporaryDirectory() as directory:

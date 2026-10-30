@@ -218,6 +218,16 @@ class Reader:
                     "history_truncated": recent and len(rows) > limit}
         return self.query(read)
 
+    def validate_cursor(self, run_id: str, cursor: int) -> Result[None]:
+        if cursor == 0:
+            return Ok(None)
+        row = self.query(lambda c: c.execute("SELECT run_id FROM samples WHERE id=?", (cursor,)).fetchone())
+        if isinstance(row, Err):
+            return row
+        if row.value is None or row.value["run_id"] != run_id:
+            return Err(Failure("invalid_input", "El cursor no pertenece a esta corrida"))
+        return Ok(None)
+
     @traced("SQLiteReader.latest", fields=("run_id",))
     def latest(self, run_id: str) -> Result[list[dict]]:
         return self.query(lambda c: [dict(id=r["id"], **json.loads(r["payload"])) for r in c.execute(

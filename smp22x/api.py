@@ -29,7 +29,8 @@ class ApiFailure(Exception):
 def unpack(result):
     if isinstance(result, Err):
         e = result.error
-        raise ApiFailure(404 if e.code == "run_not_found" else 503, e.code, e.message, e.retryable)
+        status = 404 if e.code == "run_not_found" else 422 if e.code == "invalid_input" else 503
+        raise ApiFailure(status, e.code, e.message, e.retryable)
     return result.value
 
 
@@ -102,6 +103,7 @@ def create_app(config: Settings | None = None) -> FastAPI:
                 address: int | None = Query(None, ge=1, le=247), start: str | None = None,
                 end: str | None = None, recent: bool = False):
         unpack(reader.run(run_id))
+        unpack(reader.validate_cursor(run_id, after_id))
         start, end = utc_filter(start), utc_filter(end)
         if start and end and start > end:
             raise ApiFailure(422, "invalid_input", "start debe ser anterior a end")
@@ -134,6 +136,7 @@ def create_app(config: Settings | None = None) -> FastAPI:
                 raise ValueError()
         except ValueError:
             raise ApiFailure(422, "invalid_input", "Last-Event-ID inválido")
+        unpack(await run_in_threadpool(reader.validate_cursor, run_id, cursor))
 
         async def generate():
             nonlocal cursor

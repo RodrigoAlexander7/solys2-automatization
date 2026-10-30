@@ -28,8 +28,9 @@ def main():
             raise KeyboardInterrupt()
         signal.signal(signal.SIGTERM, stop)
         try:
-            children.append(subprocess.Popen([sys.executable, "-m", "smp22x", "log", "--no-plot"], cwd=ROOT))
-            children.append(subprocess.Popen([sys.executable, "-m", "smp22x", "dashboard"], cwd=ROOT))
+            options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {}
+            children.append(subprocess.Popen([sys.executable, "-m", "smp22x", "log", "--no-plot"], cwd=ROOT, **options))
+            children.append(subprocess.Popen([sys.executable, "-m", "smp22x", "dashboard"], cwd=ROOT, **options))
             while children[0].poll() is None:
                 # A web crash must not stop acquisition. Report it once.
                 if children[1].poll() is not None and not getattr(main, "reported", False):
@@ -45,7 +46,7 @@ def main():
                     if sys.platform != "win32":
                         child.send_signal(signal.SIGTERM)
                     else:
-                        child.terminate()
+                        child.send_signal(signal.CTRL_BREAK_EVENT)
             for child in children:
                 try:
                     child.wait(timeout=10)
