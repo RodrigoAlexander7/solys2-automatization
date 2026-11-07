@@ -21,22 +21,71 @@ trace_path: ContextVar[tuple[str, ...]] = ContextVar("trace_path", default=())
 logger = logging.getLogger("smp22x.trace")
 
 
-def configure_logging(level: str = "INFO") -> None:
-    if not logger.handlers:
+class ConsoleFilter(logging.Filter):
+    """En consola, solo lo inesperado: excepciones con traceback y HTTP 5xx.
+
+    Los fallos esperados (timeouts, puerto, BD ocupada) ya se ven en la línea de
+    ciclo, en los eventos o en el mensaje de error del comando.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        p = getattr(record, "payload", None) or {}
+        return bool(p.get("traceback")) or (p.get("operation") == "HTTP" and (p.get("http_status") or 0) >= 500)
+
+
+class ConsoleFormatter(logging.Formatter):
+    def __init__(self, log_file: str = "") -> None:
+        super().__init__()
+        self.log_file = log_file
+
+    def format(self, record: logging.LogRecord) -> str:
+        p = getattr(record, "payload", None) or {}
+        where = p.get("path") or p.get("operation", "")
+        message = p.get("message") or p.get("error") or (f"HTTP {p['http_status']}" if p.get("http_status") else "")
+        detail = f"; detalle en {self.log_file}" if self.log_file else ""
+        return (f"{datetime.now().strftime('%H:%M:%S')}  ERROR  {where}: {message} "
+                f"(traza {str(p.get('trace_id', ''))[:8]}{detail})")
+
+
+def configure_logging(level: str = "INFO", fmt: str = "json", log_file: str | None = None) -> None:
+    """json: todas las trazas a stderr (formato anterior).
+    texto: JSON al archivo rotativo `log_file`; en consola solo errores inesperados."""
+    from logging.handlers import RotatingFileHandler
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        handler.close()
+    if fmt == "texto":
+        console = logging.StreamHandler()
+        console.setLevel(logging.ERROR)
+        console.addFilter(ConsoleFilter())
+        console.setFormatter(ConsoleFormatter(log_file or ""))
+        logger.addHandler(console)
+        if log_file:
+            from pathlib import Path
+            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            file = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+            file.setFormatter(logging.Formatter("%(message)s"))
+            file.setLevel(level.upper())
+            logger.addHandler(file)
+        # Errores inesperados deben llegar a la consola aunque el nivel del archivo sea más alto.
+        logger.setLevel(min(logging.getLevelName(level.upper()), logging.ERROR))
+    else:
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
-    logger.setLevel(level.upper())
+        logger.setLevel(level.upper())
     logger.propagate = False
 
 
 def emit(operation: str, status: str, duration_ms: float = 0, **context) -> None:
+    level = logging.ERROR if status == "FAILED" else logging.INFO
+    if not logger.isEnabledFor(level):
+        return  # no serializar trazas que nadie va a leer (CPU en la mini-PC)
     payload = dict(time_utc=datetime.now(timezone.utc).isoformat(), operation=operation,
                    path=" -> ".join(trace_path.get() or (operation,)),
                    trace_id=trace_id.get(), status=status, duration_ms=round(duration_ms, 3),
                    **context)
-    logger.log(logging.ERROR if status == "FAILED" else logging.INFO,
-               json.dumps(payload, ensure_ascii=False, default=str))
+    logger.log(level, json.dumps(payload, ensure_ascii=False, default=str), extra={"payload": payload})
 
 
 def traced(operation: str, *, fields: tuple[str, ...] = (), expected: tuple[type[Exception], ...] = ()):

@@ -11,6 +11,7 @@ fonttools==4.68.0
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
+hypothesis==6.170.15
 idna==3.20
 kiwisolver==1.5.1
 matplotlib==3.11.2
@@ -20,13 +21,16 @@ opentelemetry-api==1.45.2
 packaging==26.3
 pandas==3.1.0
 pillow==13.0.0
+psutil==7.2.2
 pydantic==2.14.2
 pydantic_core==2.50.2
+pyarrow==26.0.1
 pyparsing==3.3.3
 pyserial==3.5
 python-dateutil==3.0.0
 python-dotenv==1.2.4
 six==1.17.0
+sortedcontainers==2.4.0
 starlette==1.10.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0

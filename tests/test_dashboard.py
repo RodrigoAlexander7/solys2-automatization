@@ -16,11 +16,21 @@ from smp22x.acquisition import Acquisition, AcquisitionConfig
 from smp22x.api import create_app
 from smp22x.config import Settings, settings, environment
 from smp22x.metrics import comparison
+from smp22x.minutes import MinuteAggregator
 from smp22x.result import Err, Failure, Ok, require, StorageFailure
 from smp22x.sensor import Sample, SMPSensor
 from smp22x.storage import Reader, Writer
 from smp22x.tracing import traced, trace_id, trace_path
 from test_smp22x import FakeBus, fast_regs
+
+
+LOCAL = "http://127.0.0.1:8050"
+
+
+def local_settings(db: Path, **overrides) -> Settings:
+    """Rutas aisladas junto a la BD de prueba; nunca toca data/ del proyecto."""
+    return Settings(db=db, frontend=db.parent / "absent", observatory=db.parent / "observatory.sqlite3",
+                    archive_dir=db.parent / "archive", references=db.parent / "absent-refs", **overrides)
 
 
 def sample(address=3, value=812.3, offset=0):
@@ -126,9 +136,12 @@ class StoreTests(unittest.TestCase):
         self.assertIsInstance(self.reader.export("run", target), Err)
 
     def test_failed_samples_retained_and_excluded_from_means(self):
-        failed = Sample(3, sample().time_utc, ok=False, error="timeout", error_code="communication_error")
-        self.insert(0, [sample()])
-        self.insert(1, [failed])
+        good = sample()
+        failed = Sample(3, good.time_utc, ok=False, error="timeout", error_code="communication_error")
+        agg = MinuteAggregator(1)
+        require(self.writer.commit_cycle("run", 0, [good], {}, minutes=agg.add(good)))
+        require(self.writer.commit_cycle("run", 1, [failed], {}, minutes=agg.add(failed) + agg.flush()))
+        self.assertEqual(len(require(self.reader.samples("run"))["items"]), 2)
         minutes = require(self.reader.minutes("run"))
         self.assertEqual(sum(r["n_samples"] for r in minutes), 2)
         self.assertEqual(sum(r["n_valid"] for r in minutes), 1)
@@ -153,13 +166,13 @@ class ApiTests(unittest.TestCase):
 
     def setUp(self):
         StoreTests.setUp(self)
-        self.client = TestClient(create_app(Settings(db=self.path, frontend=self.path.parent / "absent")))
+        self.client = TestClient(create_app(local_settings(self.path)), base_url=LOCAL)
 
     def test_empty_unknown_and_missing_database(self):
         self.assertEqual(self.client.get("/api/runs/run/samples").json()["items"], [])
         self.assertEqual(self.client.get("/api/runs/absent").status_code, 404)
         self.writer.close()
-        missing = TestClient(create_app(Settings(db=self.path.parent / "missing.db")))
+        missing = TestClient(create_app(local_settings(self.path.parent / "missing.db")), base_url=LOCAL)
         self.assertEqual(missing.get("/api/runs").status_code, 503)
 
     def test_validation_and_trace_id(self):
@@ -170,7 +183,8 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(response.json()["trace_id"], response.headers["X-Trace-ID"])
 
     def test_only_read_routes(self):
-        self.assertEqual(self.client.post("/api/runs").status_code, 405)
+        self.assertEqual(self.client.post("/api/runs", json={}, headers={"Origin": LOCAL}).status_code, 405)
+        self.assertEqual(self.client.post("/api/runs", json={}).status_code, 403)
         self.insert()
         self.assertEqual(len(self.client.get("/api/runs/run/samples").json()["items"]), 1)
 
@@ -217,8 +231,8 @@ class ErrorTests(unittest.TestCase):
 
     def test_low_light_and_unpaired_comparison(self):
         self.assertIsNone(comparison([])["difference_pct"])
-        from smp22x.storage import sample_record
-        rows = [sample_record(sample(3, 0), 1), sample_record(sample(4, 0), 1)]
+        rows = [{"address": a, "sensor_type": "pyranometer", "valid": True, "measurement": 0.0, "cycle": 1}
+                for a in (3, 4)]
         self.assertIsNone(comparison(rows)["difference_pct"])
         rows[1]["cycle"] = 2
         self.assertIsNone(comparison(rows)["difference_wm2"])

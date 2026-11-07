@@ -204,3 +204,68 @@ Cada 60 s se hace además una lectura de los registros 16 y 17 (IO_RH e IO_PRESS
 - **Umbral y límites:** ±5 W/m² es una tolerancia elegida por el proyecto, no una especificación de calibración del fabricante. La coincidencia es consistencia interna; ambas vías usan datos del instrumento. Hoy no modifica `Sample.valid`.
 - **Riesgo pendiente:** el SGR4 de la prueba 01 tiene data model 102 y [MAN] describe el 108. No se ha confirmado 10–11 con ese significado en el 102. Calcular Ld↓ desde neta y temperatura sería una alternativa que también requiere validar el perfil y etiquetar el resultado como calculado; no se activa automáticamente en el código actual.
 - **Código:** `registers.py` (`IO_SENSOR2_DATA`, `PYRGEOMETER_BLOCK_COUNT`, `OBSERVED_DEVICE_TYPES`), `sensor.py` (`Sample.measurement`, `Sample.lw_down_calc`), `cli.py` (`--pyrgeometers`), `plotting.py` (`_plot_longwave`).
+
+## D16. Esquema 2: columnas tipadas en lugar de JSON
+
+- **Problema:** el esquema 1 guardaba un JSON por muestra: ~1,1 KB por fila, unos 280 MB por día con 3 sensores, y un `json.loads` por fila en cada consulta.
+- **Decisión:** una columna por magnitud y una por palabra Modbus original (`reg_2` … `reg_11`, `reg_16`, `reg_17`); hora en milisegundos UTC enteros; clave entera de corrida; `conversion_version` por corrida. Los derivados (`measurement`, neta + σT⁴) se calculan al leer.
+- **Resultado medido:** ~217 B por fila en un día simulado (`tests/test_storage_v2.py` exige menos de 320).
+- **Migración:** `smp22x migrate` exige el lock de escritor, copia la BD con la API de backup (`*.v1-backup-*.sqlite3`), convierte, recalcula minutos, compara campo por campo y solo entonces reemplaza el archivo. Un esquema 1 sin migrar se rechaza con un mensaje que indica el comando.
+
+## D17. Archivo Parquet y retención
+
+- **Decisión:** 1 s durante 30 días en la base activa; cada día UTC cerrado se escribe una vez en `archive/AAAA/MM/AAAA-MM-DD.parquet` (zstd, metadatos de esquema y conversión); los minutos y eventos se conservan siempre en SQLite.
+- **Seguridad del borrado:** solo se poda un día vencido si su archivo coincide con el manifiesto (filas y SHA-256) y contiene todos los `id` del día que siguen en la base. Si llegan filas tardías (reloj corregido), el día se reescribe uniendo lo archivado con lo nuevo.
+- **Sin retrasar el ciclo:** un hilo escribe y verifica con una conexión de solo lectura; el bucle registra el manifiesto y poda en lotes de 2000 filas por ciclo. `smp22x archive` hace lo mismo de forma sincrónica con la adquisición detenida.
+- **Por qué Parquet:** columnar, comprimido y legible desde Python, R, MATLAB y DuckDB. Excel no lo abre: por eso la descarga en CSV se mantiene.
+
+## D18. Configuración versionada y roles
+
+- **Decisión:** una base aparte (`observatory.sqlite3`), escrita solo por la web, guarda versiones de configuración (sitio, SOLYS2 en uso, bola de sombra y etiqueta por dirección, umbrales) y la bitácora. Ambas son de solo agregar; una nota se anula, no se borra.
+- **Rol ≠ modelo:** el rol de cada lectura (GHI, DHI, LWD o `SHADE_OFF`) sale del tipo de sensor, la bola de sombra y el estado del SOLYS2 **vigentes en ese instante**. Cambiar la configuración hoy no altera la interpretación de días anteriores; una vigencia retroactiva exige nota.
+- **SOLYS2 inactivo:** el piranómetro con bola se sigue registrando, pero no se presenta como difusa y las pruebas que dependen del seguidor dicen «no aplica».
+
+## D19. Control de calidad
+
+- **BSRN:** límites físicamente posibles y extremadamente raros para GHI, DHI y Ld↓, y cociente difusa/global, según Long y Dutton (2010). `Sa = 1361 W/m² / R²` (Kopp y Lean, 2011) y `μ0 = max(cos z, 0)`.
+- **Pruebas del proyecto, ajustables:** sombreado (z < 75°, GHI > 50, kt > 0,6 ⇒ DHI/GHI ≤ 0,8) y comparación entre instrumentos del mismo rol (5 %). El cociente BSRN no detecta una bola que no tapa el sol (DHI ≈ GHI pasa la prueba); por eso existe la de sombreado.
+- **Nunca se modifica el dato:** cada prueba da `ok`, `fail` o `na` con motivo; un test por propiedades lo verifica. Se aplica a 1 s y a promedios de 1 min (como en BSRN).
+- **Posición solar:** algoritmo NOAA/Meeus vectorizado con refracción; diferencia con el vector de referencia de NREL SPA menor a 0,003° en cenit y acimut. Se prefirió a `pvlib` para no sumar una dependencia pesada; el test fija la tolerancia en 0,02°.
+- **Sin pirheliómetro:** la DNI se presenta solo como estimada `(GHI − DHI)/cos z` con z < 80°. El test de cierre queda para cuando haya DNI medida.
+
+## D20. Comprobación del reloj por SNTP
+
+- **Decisión:** la adquisición consulta un servidor NTP cada 600 s en un hilo aparte y registra desfase, retardo y servidor como evento. No ajusta el reloj ni corrige marcas: corregir hora es tarea del sistema operativo, y las comprobaciones viajan en cada exportación para corregir después si hace falta.
+- **Aviso:** desfase mayor a 1 s, sin referencia o sin comprobación reciente. El umbral sigue el criterio de BSRN: relojes dentro de un segundo (`references/BSRN-standars/`, Operations Manual V2.1 §2.3.1, pp. 13–14). Es configurable.
+
+## D21. Eventos con límite de frecuencia
+
+- **Problema:** un flag como `VOID_DATA` puede alternar cada segundo y llenar la base.
+- **Decisión:** un evento de flags por dirección cada 10 s como máximo; al vencer la ventana se emite el estado vigente con el número de cambios intermedios. El último evento siempre coincide con el último estado observado. Sensor sin respuesta: a los 5 fallos seguidos, igual que el backoff.
+
+## D22. Protección local sin inicio de sesión
+
+- **Decisión:** el dashboard es local. Toda petición debe traer un `Host` local (evita DNS rebinding) y toda escritura un `Origin` igual al host y JSON (evita que una página abierta en el navegador del PC escriba en la bitácora). La web se niega a escuchar fuera de localhost sin autenticación, salvo contenedor publicado solo en loopback (`SMP_CONTAINER_LOOPBACK=1`).
+- **Caché:** el HTML se sirve con `Cache-Control: no-cache` y los assets con hash como inmutables. Sin esto, el navegador conservaba un `index.html` viejo tras actualizar.
+
+## D24. Monitor de 1 minuto y series reducidas
+
+- **Problema:** la mini-PC se saturaba con Chrome abierto y empeoraba con el tiempo. El monitor arrancaba con 15 min (900 puntos por serie) y redibujaba todos los gráficos cada segundo; las ventanas de 24 h y 7 días cargaban miles de puntos más.
+- **Decisión:** el monitor muestra solo los últimos 60 s. El histórico dibuja como máximo ~600 puntos por serie: el servidor divide en tramos y conserva el mínimo y el máximo de cada uno en el orden en que ocurrieron (los picos siguen visibles); un tramo sin válidas devuelve una fila vacía, que corta la línea. La descarga no se reduce nunca.
+- **Comprobación:** prueba de permanencia opcional (`SOAK_MINUTES`) que mide el heap de JavaScript cada 30 s.
+
+## D25. Ventana liviana con Tkinter
+
+- **Decisión:** una interfaz alternativa sin navegador ni servidor web, porque el costo fijo de Chrome es lo que satura la mini-PC. Tkinter viene con Python; se dibuja en un `Canvas` sin matplotlib (redibujar una figura de matplotlib cada segundo cuesta mucha más CPU).
+- **Consumo medido** (`scripts/medir_consumo.py`, PC Linux de desarrollo, 60 s): ventana 0,3 % de CPU y 27 MB; Chromium headless con el monitor Svelte de 1 minuto 2,5 % y 516 MB en 6 procesos. Falta repetirlo en la mini-PC.
+- **Alcance:** sin SOLYS2, bola de sombra ni QC; CSV con las columnas clásicas para no contradecir la configuración del dashboard completo. Minimizada no consulta ni dibuja; al restaurarse relee el último minuto.
+
+## D26. Terminal legible y trazas a archivo
+
+- **Problema:** cada lectura y cada guardado escribían una línea JSON en la terminal (varias por segundo).
+- **Decisión:** la terminal muestra una línea por ciclo (o un resumen cada N s) y los eventos en español; solo los errores inesperados aparecen como una línea con código de traza. El JSON completo va a `data/logs/<comando>.jsonl` (5 MB × 5), por defecto solo con fallos. `emit` no serializa trazas que ningún destino va a escribir. `SMP_LOG_FORMAT=json` restaura el formato anterior.
+
+## D23. Gráficos y documentación sin internet
+
+- **Gráficos:** uPlot (canvas, sin CDN) con cursor sincronizado, zoom y PNG por gráfico. Una lectura válida aislada entre huecos se dibuja como punto: no puede quedar invisible. El carpet plot (día × hora) usa canvas.
+- **Documentación para físicos:** `docs/fisicos/*.md` se compila en el build con `marked`; es la misma fuente que se lee en el repositorio. Los manuales se sirven en `/manuales` si existe `references/`.

@@ -12,10 +12,12 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["env", "run", "help"])
+    parser.add_argument("command", choices=["env", "run", "run-ligero", "help"])
     command = parser.parse_args().command
     if command == "help":
-        print("make install | check | test | build | acquire | web | run")
+        print("make install | check | test | test-e2e | test-perf | test-hardware | build | acquire | web | run")
+        print("make ventana (interfaz liviana sin navegador) | run-ligero (adquisición + ventana liviana)")
+        print("make migrate (esquema 1 → 2, adquisición detenida) | archive (Parquet y retención, adquisición detenida)")
         print("make docker-up | docker-web | docker-down | docker-logs | docker-test")
         print("Windows sin make: python scripts/manage.py env; luego usar .venv\\Scripts\\python -m smp22x")
     elif command == "env":
@@ -30,12 +32,16 @@ def main():
         signal.signal(signal.SIGTERM, stop)
         try:
             options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {}
+            light = command == "run-ligero"
+            viewer = ["ventana"] if light else ["dashboard"]
             children.append(subprocess.Popen([sys.executable, "-m", "smp22x", "log", "--no-plot"], cwd=ROOT, **options))
-            children.append(subprocess.Popen([sys.executable, "-m", "smp22x", "dashboard"], cwd=ROOT, **options))
+            children.append(subprocess.Popen([sys.executable, "-m", "smp22x", *viewer], cwd=ROOT, **options))
             while children[0].poll() is None:
-                # A web crash must not stop acquisition. Report it once.
+                # Cerrar la web o la ventana no detiene la adquisición. Se avisa una vez.
                 if children[1].poll() is not None and not getattr(main, "reported", False):
-                    print("Web terminada; adquisición continúa. Puede reiniciar con make web.")
+                    again = "make ventana" if light else "make web"
+                    print(f"{'Ventana cerrada' if light else 'Web terminada'}; la adquisición continúa. "
+                          f"Puede volver a abrirla con {again}.")
                     main.reported = True
                 time.sleep(.5)
             return children[0].returncode

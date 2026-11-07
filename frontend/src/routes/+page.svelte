@@ -1,158 +1,269 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import Chart from '$lib/Chart.svelte';
-  import { get, format, mergeRows, makeSeries, differenceSeries, type Run, type Sample, type Status, type Page, type ApiError } from '$lib/data';
+  import TimeChart from '$lib/TimeChart.svelte';
+  import { live } from '$lib/live.svelte';
+  import { get, query, type ApiError, type LogbookEntry, type Point, type Sample } from '$lib/api';
+  import { align, colorFor, differenceRows, format, fromPoint, localDate, mergePoints, pairsByRole,
+           QC_TEXT, ROLE_NAMES, type Group, type Row } from '$lib/data';
 
-  let runs = $state<Run[]>([]), selected = $state(''), rows = $state<Sample[]>([]);
-  let status = $state<Status | null>(null), error = $state<ApiError | null>(null);
-  let connected = $state(false), loading = $state(false), tick = $state(Date.now());
-  let source: EventSource | null = null, generation = 0, disposed = false;
-  let retryTimer: ReturnType<typeof setTimeout> | undefined;
-  const date = (s: string) => new Date(s).toLocaleString('es', { dateStyle: 'short', timeStyle: 'medium' });
-  let current = $derived(runs.find(r => r.id === selected));
-  let latest = $derived(status?.latest ?? []);
-  let interval = $derived(current?.metadata.config.interval_s ?? 1);
-  let short = $derived([...new Set(rows.filter(r => r.sensor_type === 'pyranometer').map(r => r.address))]);
-  let long = $derived([...new Set(rows.filter(r => r.sensor_type === 'pyrgeometer').map(r => r.address))]);
-  let all = $derived([...new Set(rows.map(r => r.address))]);
-  let live = $derived(status?.run.state === 'running' && !status?.acquisition_stale && connected);
-  let windowRows = $derived.by(() => {
-    if (!rows.length) return [];
-    const end = Math.max(...rows.map(r => Date.parse(r.time_utc)));
-    return rows.filter(r => Date.parse(r.time_utc) >= end - 15 * 60 * 1000);
+  // R28: el monitor muestra solo el último minuto (≤ 60 puntos por serie a 1 s) para no
+  // saturar la mini-PC. Los intervalos largos se consultan en el histórico.
+  const MONITOR_WINDOW_MS = 60_000;
+  const SW = new Set(['GHI', 'DHI', 'SHADE_OFF']);
+  const TEST_NAMES: Record<string, string> = { ppl: 'físicamente posible', erl: 'extremadamente raro', ratio: 'cociente DHI/GHI', shading: 'sombreado', comparison: 'comparación' };
+
+  let points = $state<Point[]>([]);
+  let notes = $state<LogbookEntry[]>([]);
+  let loading = $state(false), error = $state<ApiError | null>(null), connected = $state(false);
+  let tick = $state(Date.now());
+  let source: EventSource | null = null, generation = 0, streamKey = '';
+
+  let data = $derived(live.data);
+  let run = $derived(data?.run ?? null);
+  let latest = $derived(data?.latest ?? []);
+  let interval = $derived(run?.metadata.config.interval_s ?? 1);
+  let rows: Row[] = $derived(points.map(fromPoint));
+  let addresses = $derived([...new Set([...rows.map(r => r.address), ...latest.map(s => s.address)])].sort((a, b) => a - b));
+  let step = $derived(Math.max(1000, interval * 1000));
+  let markers = $derived(notes.filter(n => !n.voided).map(n => ({ t_ms: n.t_ms, label: n.category_label })));
+  let running = $derived(run?.state === 'running' && !data?.acquisition_stale);
+
+  function roleGroups(filter: (r: Row) => boolean, value: (r: Row) => number | null | undefined, suffix = true): Group[] {
+    const seen = new Map<string, Row>();
+    for (const r of rows) if (filter(r)) seen.set(`${r.address}:${r.role}`, r);
+    return [...seen.values()].sort((a, b) => a.address - b.address).map(r => ({
+      label: suffix ? `${r.label} · ${ROLE_NAMES[r.role]}` : r.label, color: colorFor(r.address, addresses),
+      dashed: r.role === 'SHADE_OFF', filter: x => x.address === r.address && x.role === r.role && filter(x), value
+    }));
+  }
+  const failed = (r: Row) => r.qc === 'suspect' || r.qc === 'bad';
+
+  let shortwave = $derived(align(rows, [
+    ...roleGroups(r => SW.has(r.role), r => r.value),
+    { label: 'QC con falla', color: '#c0392b', pointsOnly: true, filter: r => SW.has(r.role) && failed(r), value: r => r.value }
+  ], step));
+  let longwave = $derived(align(rows, [
+    ...roleGroups(r => r.role === 'LWD', r => r.value),
+    ...roleGroups(r => r.role === 'LWD', r => r.calc, false).map(g => ({ ...g, label: `${g.label} · neta + σT⁴`, color: '#8aa2b7', dashed: true })),
+    { label: 'QC con falla', color: '#c0392b', pointsOnly: true, filter: r => r.role === 'LWD' && failed(r), value: r => r.value }
+  ], step));
+  let pairs = $derived(pairsByRole(rows));
+  let comparison = $derived.by(() => {
+    const combined: Row[] = [];
+    pairs.forEach((p, i) => {
+      for (const d of differenceRows(rows.filter(r => r.role === p.role), p.a, p.b)) combined.push({ ...d, address: -1 - i });
+    });
+    return align(combined, pairs.map((p, i) => ({
+      label: `${ROLE_NAMES[p.role]}: #${p.a} − #${p.b}`, color: ['#7966a8', '#c2577a', '#3b8fa3'][i % 3],
+      filter: (r: Row) => r.address === -1 - i, value: (r: Row) => r.value
+    })), step);
   });
-  let longSeries = $derived([
-    ...makeSeries(windowRows, long, 'lw_down', interval, 'Ld↓ #'),
-    ...makeSeries(windowRows, long, 'lw_down_calc', interval, 'Neta + σT⁴ #').map(s => ({ ...s, color: '#8aa2b7', dashed: true }))
-  ]);
-  const age = (s: Sample) => Math.max(0, (tick - Date.parse(s.time_utc)) / 1000);
-  const stale = (s: Sample) => age(s) > (status?.stale_s ?? 5);
-  const sensor = (address: number) => latest.find(s => s.address === address);
+  let hasDhi = $derived(rows.some(r => r.role === 'DHI'));
+  let dniData = $derived(align(rows, [
+    { label: 'DNI estimada (GHI − DHI)/cos z', color: '#7966a8', filter: r => r.role === 'DHI', value: r => r.dni }
+  ], step));
+  let ratio = $derived(align(rows, [
+    { label: 'DHI / GHI', color: '#3b8fa3', filter: r => r.role === 'DHI', value: r => r.ratio }
+  ], step));
+  let temperature = $derived(align(rows, roleGroups(() => true, r => r.temp, false), step));
+  let rtt = $derived(align(rows, roleGroups(() => true, r => r.rtt, false), step));
+  let supply = $derived(align(rows, roleGroups(() => true, r => r.supply, false), step));
 
-  async function updateStatus(id: string, version: number) {
-    const result = await get<Status>(`/api/runs/${id}/status`);
-    if (disposed || version !== generation) return null;
-    if (result.ok) { status = result.value; return result.value; }
-    else error = result.error;
-    return null;
+  const iso = (t: number) => new Date(t).toISOString();
+  const age = (s: Sample) => Math.max(0, (tick - Date.parse(s.time_utc)) / 1000);
+  const stale = (s: Sample) => age(s) > (data?.stale_s ?? 5);
+  const readingState = (s: Sample) => !s.ok ? 'SIN RESPUESTA' : stale(s) ? 'ANTERIOR' : s.valid ? 'VÁLIDA' : 'INVÁLIDA';
+  const failedTests = (s: Sample) => Object.entries(TEST_NAMES).filter(([k]) => s.qc[k as keyof typeof s.qc] === 'fail').map(([, v]) => v);
+
+  async function loadNotes(start: number, end: number) {
+    const result = await get<{ items: LogbookEntry[] }>(`/api/logbook${query({ start: iso(start), end: iso(end), include_voided: false })}`);
+    if (result.ok) notes = result.value.items;
   }
 
-  async function selectRun(id: string) {
-    source?.close(); source = null; clearTimeout(retryTimer);
+  async function load() {
     const version = ++generation;
-    selected = id; rows = []; status = null; connected = false; loading = true; error = null;
-    const result = await get<Page>(`/api/runs/${id}/samples?recent=true&limit=3600`);
-    if (disposed || version !== generation) return;
+    closeStream();
+    loading = true;
+    const end = Date.now(), start = end - MONITOR_WINDOW_MS;
+    const result = await get<{ items: Point[] }>(`/api/series${query({ start: iso(start), end: iso(end), resolution: '1s' })}`);
+    if (version !== generation) return;
     loading = false;
-    if (!result.ok) {
-      error = result.error;
-      retryTimer = setTimeout(() => { if (!disposed && version === generation) void selectRun(id); }, 3000);
-      return;
-    }
-    rows = result.value.items;
-    const fresh = await updateStatus(id, version);
-    if (disposed || version !== generation || fresh?.run.state !== 'running') return;
-    source = new EventSource(`/api/runs/${id}/stream?after_id=${result.value.next_cursor}`);
-    source.onopen = () => { if (version === generation) { connected = true; error = null; } };
+    if (!result.ok) { error = result.error; return; }
+    error = null;
+    points = result.value.items;
+    void loadNotes(start, end);
+    connect();
+  }
+
+  function closeStream() { source?.close(); source = null; connected = false; streamKey = ''; }
+
+  function connect() {
+    if (!run || run.state !== 'running') return;
+    const key = run.id;
+    if (key === streamKey && source) return;
+    closeStream();
+    streamKey = key;
+    const ids = [...points.filter(p => p.run_id === run!.id).map(p => p.id), ...latest.filter(s => s.run_id === run!.id).map(s => s.id)];
+    const cursor = ids.length ? Math.max(...ids) : 0;
+    const version = generation;
+    source = new EventSource(`/api/runs/${run.id}/stream?after_id=${cursor}`);
+    source.onopen = () => { if (version === generation) connected = true; };
     source.onerror = () => { if (version === generation) connected = false; };
     source.addEventListener('samples', event => {
-      if (version !== generation || disposed) return;
-      try { rows = mergeRows(rows, (JSON.parse((event as MessageEvent).data) as Page).items); }
-      catch { error = { code: 'invalid_response', message: 'Evento de datos inválido' }; }
-    });
-    source.addEventListener('failure', event => {
       if (version !== generation) return;
-      const data = JSON.parse((event as MessageEvent).data);
-      error = { code: data.error, message: 'La adquisición no está disponible', trace_id: data.trace_id };
-      connected = false;
-      source?.close();
-      retryTimer = setTimeout(() => { if (!disposed && version === generation) void selectRun(id); }, 3000);
+      try {
+        const page = JSON.parse((event as MessageEvent).data) as { items: Point[] };
+        points = mergePoints(points, page.items, Date.now() - MONITOR_WINDOW_MS);
+      } catch { error = { code: 'invalid_response', message: 'Evento de datos inválido' }; }
     });
+    source.addEventListener('failure', () => { if (version === generation) { closeStream(); setTimeout(() => { if (version === generation) void load(); }, 3000); } });
   }
 
+  // Nueva corrida o corrida que termina: reconectar o cerrar el stream.
+  $effect(() => {
+    const key = run && run.state === 'running' ? run.id : '';
+    if (!key) { if (source) closeStream(); return; }
+    if (key !== streamKey) connect();
+  });
+
   onMount(() => {
-    let timer: ReturnType<typeof setTimeout>;
-    let iteration = 0;
-    async function refresh() {
+    void load();
+    // Sin datos nuevos (adquisición detenida) también se descarta lo que salió de la ventana.
+    const clock = setInterval(() => {
       tick = Date.now();
-      if (iteration++ % 5 === 0 || !runs.length) {
-        const result = await get<{ items: Run[] }>('/api/runs');
-        if (disposed) return;
-        if (result.ok) {
-          runs = result.value.items;
-          if (!selected && runs.length) void selectRun(runs[0].id);
-          if (error?.code === 'network_error' || error?.code === 'database_unavailable') error = null;
-        } else error = result.error;
-      }
-      if (selected) await updateStatus(selected, generation);
-      if (!disposed) timer = setTimeout(refresh, 1000);
-    }
-    void refresh();
-    const clock = setInterval(() => { tick = Date.now(); }, 1000);
-    return () => { disposed = true; generation++; clearTimeout(timer); clearTimeout(retryTimer); clearInterval(clock); source?.close(); };
+      if (points.length && points[0].t_ms < tick - MONITOR_WINDOW_MS - 5000) points = mergePoints(points, [], tick - MONITOR_WINDOW_MS);
+    }, 1000);
+    const slow = setInterval(() => void loadNotes(Date.now() - MONITOR_WINDOW_MS, Date.now()), 60_000);
+    return () => { generation++; clearInterval(clock); clearInterval(slow); closeStream(); };
   });
 </script>
 
-<svelte:head>
-  <title>Radiometría · Observatorio local</title>
-  <meta name="description" content="Adquisición y seguimiento local de radiación de onda corta y larga" />
-</svelte:head>
+<svelte:head><title>Monitor · Radiometría</title></svelte:head>
 
-<div class="app">
-  <aside>
-    <div class="brand"><span class="brand-icon">☼</span><div>RADIOMETRÍA<small>OBSERVATORIO LOCAL</small></div></div>
-    <div class="section-label">ESPACIO DE TRABAJO</div>
-    <div class="nav-active"><span>◉</span> Monitor de adquisición</div>
-    <div class="side-description">Corridas e históricos<br />SMP22x / SGR4</div>
-    <div class="equipment"><div class="section-label">INSTRUMENTOS</div><p><i class="blue"></i>#2 · SGR4<small>Onda larga · pirgeómetro</small></p><p><i class="orange"></i>#3 · SMP22x<small>Onda corta · piranómetro</small></p><p><i class="green"></i>#4 · SMP22x<small>Onda corta · piranómetro</small></p></div>
-    <div class="local"><span>●</span> Datos en este equipo<small>SQLite · sin servicios externos</small></div>
-  </aside>
+<section class="page-head">
+  <div>
+    <div class="eyebrow">ADQUISICIÓN DE RADIACIÓN</div>
+    <h1>Monitor de adquisición</h1>
+    <p>Mediciones tal como las entrega cada sensor, con su rol, calidad y contexto. Los derivados (DNI estimada, cocientes, neta + σT⁴) se indican como tales.</p>
+  </div>
+  <div class="connection" class:active={running && connected}>
+    <i></i>{running ? (connected ? 'En vivo' : 'Conectando…') : run ? 'Corrida terminada · histórico' : 'Esperando adquisición'}
+  </div>
+</section>
 
-  <main>
-    <header><div class="breadcrumb">Laboratorio <span>/</span> Monitor</div><span class="local-pill">LOCAL · SOLO LECTURA</span></header>
-    <section class="title-row"><div><div class="eyebrow">ADQUISICIÓN DE RADIACIÓN</div><h1>Monitor de adquisición</h1><p>Mediciones de onda corta y larga, con su contexto y calidad.</p></div><div class:active={live} class="connection"><i></i>{live ? 'En vivo' : status?.run.state === 'running' ? 'Reconectando / sin datos recientes' : 'Histórico / en espera'}</div></section>
-
-    <div class="toolbar"><label for="run">CORRIDA<select id="run" value={selected} onchange={event => void selectRun(event.currentTarget.value)}><option value="" disabled>Seleccionar corrida</option>{#each runs as run}<option value={run.id}>{run.metadata.config.label || 'Sin etiqueta'} · {date(run.started_utc)}</option>{/each}</select></label><div class="run-meta"><span>{current ? date(current.started_utc) : 'Sin corrida seleccionada'}</span><strong>{current?.metadata.simulated ? 'SIMULADO' : current ? 'HARDWARE' : 'EN ESPERA'}</strong><span>{format(interval, 1)} s / ciclo</span></div></div>
-
-    {#if error}<div class="notice error" role="alert"><strong>{error.code}</strong> · {error.message}{#if error.trace_id}<small>Traza: {error.trace_id}</small>{/if}</div>{/if}
-    {#if status?.acquisition_stale}<div class="notice" role="alert">La adquisición no confirma actividad reciente. Los valores visibles pueden estar desactualizados.</div>{/if}
-    {#if !runs.length && !error}<div class="notice">Esperando la primera corrida. Inicia la adquisición para ver las mediciones.</div>{/if}
-
-    <section class="cards" aria-label="Mediciones principales">
-      {#each [3, 4, 2] as address}
-        {@const s = sensor(address)}
-        <article class="value-card" class:old={s && stale(s)}><div class="card-label"><span><i class:blue={address === 2} class:orange={address === 3} class:green={address === 4}></i>#{address} · {address === 2 ? 'SGR4' : 'SMP22x'}</span><span>{s ? !s.ok ? 'SIN RESPUESTA' : stale(s) ? 'ANTERIOR' : s.valid ? 'VÁLIDA' : 'INVÁLIDA' : 'SIN DATOS'}</span></div><h2>{address === 2 ? 'Onda larga descendente' : 'Irradiancia de onda corta'}</h2><div class="reading">{format(s?.valid ? s.measurement : null)}<span>W/m²</span></div><footer>{s ? `Última lectura hace ${format(age(s), 0)} s` : 'Esperando lectura'}{#if address === 2}<span>Neta: {format(s?.net_longwave_wm2)} W/m²</span>{/if}</footer></article>
-      {/each}
-      <article class="value-card compare"><div class="card-label"><span>COMPARACIÓN · #3 / #4</span></div><h2>Diferencia relativa</h2><div class="reading">{format(status?.comparison.difference_pct, 2)}<span>%</span></div><footer>{format(status?.comparison.difference_wm2)} W/m²<small>Solo pares válidos; media &gt;100 W/m²</small></footer></article>
-    </section>
-
-    <div class="section-heading"><h2>Señales y diagnósticos</h2><span>{loading ? 'Cargando…' : 'Ventana de hasta 15 min · máximo 3600 muestras'} · hora local</span></div>
-    <section class="charts">
-      <Chart title="Irradiancia de onda corta" unit="W/m²" series={makeSeries(windowRows, short, 'shortwave_wm2', interval)} subtitle="Valores del sensor en unidades físicas; sin corrección adicional." />
-      <Chart title="Onda larga descendente" unit="W/m²" series={longSeries} subtitle="Línea discontinua: neta + σT⁴. Comprobación de consistencia." />
-      <Chart title="Diferencia relativa #3 − #4" unit="%" series={differenceSeries(windowRows)} subtitle="Denominador: media de ambos. Sin porcentaje cerca de cero." />
-      <Chart title="Temperatura del cuerpo" unit="°C" series={makeSeries(windowRows, all, 'body_temp_c', interval)} subtitle="Temperatura interna del instrumento; no temperatura ambiente." />
-      <Chart title="Tiempo de comunicación" unit="ms" series={makeSeries(windowRows, all, 'rtt_ms', interval)} subtitle="RTT de la consulta Modbus, distinto de la respuesta física del sensor." />
-      <Chart title="Tensión de alimentación" unit="V" series={makeSeries(windowRows, all, 'supply_v', interval)} subtitle="Lectura en el conector de cada instrumento." />
-    </section>
-
-    <section class="measurements"><div class="section-heading"><h2>Detalle de la última lectura</h2><span>Las consultas de un ciclo son secuenciales</span></div><div class="table-wrap"><table><thead><tr><th>Sensor</th><th>Magnitud principal</th><th>Temperatura</th><th>RTT</th><th>Flags</th><th>Calidad</th><th>Hora local</th></tr></thead><tbody>{#each latest as s}<tr><td><strong>#{s.address}</strong> {s.sensor_type === 'pyrgeometer' ? 'SGR4' : 'SMP'}</td><td>{format(s.measurement)} W/m²</td><td>{format(s.body_temp_c)} °C</td><td>{format(s.rtt_ms)} ms</td><td title={s.error || 'Máscara de estado'}>{s.status === null ? '—' : `0x${s.status.toString(16).padStart(4, '0')}`}</td><td><span class="quality" class:bad={!s.valid || stale(s)}>{!s.ok ? 'Sin respuesta' : stale(s) ? 'Desactualizada' : s.valid ? 'Válida' : 'Inválida'}</span>{#if s.error}<small class="sample-error">{s.error}</small>{/if}</td><td>{date(s.time_utc)}</td></tr>{:else}<tr><td colspan="7" class="table-empty">{loading ? 'Cargando lecturas…' : 'No hay lecturas para esta corrida.'}</td></tr>{/each}</tbody></table></div></section>
-    <div class="bottom"><span>Radiometría · SMP22x + SGR4</span><span>Ciclo {status?.run.status.cycle ?? '—'} · Puerto perdido {status?.run.status.port_errors ?? 0} veces · {rows.length} muestras en memoria</span></div>
-  </main>
+<div class="toolbar">
+  <div class="run-meta">
+    <span>Corrida <strong>{run?.metadata.config.label || 'sin etiqueta'}</strong></span>
+    {#if run}<span>{localDate(run.started_utc)}</span><b class:sim={run.metadata.simulated}>{run.metadata.simulated ? 'SIMULADO' : 'HARDWARE'}</b><span>{format(interval, 1)} s / ciclo</span>{/if}
+  </div>
+  <a class="history-link" href="/historico/">Intervalos más largos: Histórico</a>
 </div>
 
+{#if live.error}<div class="notice error" role="alert"><strong>{live.error.code}</strong> · {live.error.message}{#if live.error.trace_id}<small>Traza: {live.error.trace_id}</small>{/if}</div>{/if}
+{#if error}<div class="notice error" role="alert"><strong>{error.code}</strong> · {error.message}{#if error.trace_id}<small>Traza: {error.trace_id}</small>{/if}</div>{/if}
+{#each data?.alerts ?? [] as alert}<div class="notice" class:error={alert.level === 'error'} role="alert">{alert.text}</div>{/each}
+{#if data && !run}<div class="notice">Esperando la primera corrida. Inicie la adquisición para ver las mediciones.</div>{/if}
+
+<section class="cards" aria-label="Mediciones principales">
+  {#each latest as s (s.address)}
+    <article class="value-card" class:old={stale(s)}>
+      <div class="card-label"><span><i style:background={colorFor(s.address, addresses)}></i>{s.label} · {s.sensor_type === 'pyrgeometer' ? 'SGR4' : 'SMP22x'}</span><span>{readingState(s)}</span></div>
+      <h2>{ROLE_NAMES[s.role]}</h2>
+      <div class="reading">{format(s.valid ? s.measurement : null)}<span>W/m²</span></div>
+      <footer>
+        <span>Hace {format(age(s), 0)} s</span>
+        <span class="qc {s.qc.summary}" title={[...failedTests(s), ...s.qc.notes].join(' · ')}>{QC_TEXT[s.qc.summary]}</span>
+        {#if s.role === 'LWD'}<span>Neta: {format(s.net_longwave_wm2)} W/m²</span>{/if}
+        {#if s.role === 'DHI'}<span>DHI/GHI {format(s.dhi_ghi_ratio, 2)} · DNI est. {format(s.dni_est_wm2, 0)} W/m²</span>{/if}
+        {#if s.role === 'SHADE_OFF'}<span>SOLYS2 inactivo: no se presenta como difusa</span>{/if}
+      </footer>
+    </article>
+  {/each}
+  {#each data?.comparisons ?? [] as c}
+    <article class="value-card compare">
+      <div class="card-label"><span>COMPARACIÓN · #{c.a} / #{c.b}</span><span>{ROLE_NAMES[c.role]}</span></div>
+      <h2>Diferencia relativa</h2>
+      <div class="reading">{format(c.difference_pct, 2)}<span>%</span></div>
+      <footer><span>{format(c.difference_wm2)} W/m²</span><small>Mismo ciclo, ambos válidos; % solo con media &gt; 100 W/m²</small></footer>
+    </article>
+  {/each}
+  <article class="value-card info">
+    <div class="card-label"><span>SOLYS2 Y RELOJ</span></div>
+    <h2>Seguidor {data?.config.solys2_in_use ? 'en uso' : 'inactivo'}</h2>
+    <div class="reading small">{data?.clock.check?.ok ? `${format(data.clock.check.offset_s, 3)} s` : '—'}<span>desfase del reloj</span></div>
+    <footer><span>{data?.clock.check ? `NTP ${data.clock.check.server}` : data?.clock.enabled ? 'Sin comprobación todavía' : 'Comprobación deshabilitada'}</span><a href="/instrumentos/">Configurar</a></footer>
+  </article>
+</section>
+
+<div class="section-heading"><h2>Señales y diagnósticos</h2><span>{loading ? 'Cargando…' : 'Último minuto · muestras de 1 s · hora local · arrastre para ampliar, doble clic para volver'}</span></div>
+<section class="charts">
+  <TimeChart title="Onda corta" unit="W/m²" data={shortwave} {markers} filename="onda-corta" subtitle="Valores del sensor sin corrección adicional. Cruces: alguna prueba de QC falló." />
+  <TimeChart title="Onda larga descendente" unit="W/m²" data={longwave} {markers} filename="onda-larga" subtitle="Línea discontinua: neta + σT⁴, comprobación de consistencia (derivada)." />
+  {#if pairs.length}<TimeChart title="Diferencia relativa entre instrumentos del mismo rol" unit="%" digits={2} data={comparison} {markers} filename="comparacion" subtitle="Denominador: media de ambos. Sin porcentaje con media ≤ 100 W/m²." />{/if}
+  {#if hasDhi}
+    <TimeChart title="Cociente difusa / global" unit="" digits={3} data={ratio} {markers} filename="cociente" subtitle="BSRN: DHI/GHI < 1,05 con cenit < 75°. Valores cercanos a 1 con cielo claro indican que la bola no tapa el sol." />
+    <TimeChart title="DNI estimada" unit="W/m²" data={dniData} {markers} filename="dni-estimada" subtitle="Derivada (GHI − DHI)/cos z, solo con cenit < 80°. No es una medición de pirheliómetro." />
+  {/if}
+  <TimeChart title="Temperatura del cuerpo" unit="°C" data={temperature} {markers} filename="temperatura" subtitle="Temperatura interna del instrumento; no temperatura ambiente." />
+  <TimeChart title="Tiempo de comunicación" unit="ms" data={rtt} filename="rtt" subtitle="RTT de la consulta Modbus, distinto de la respuesta física del sensor." />
+  <TimeChart title="Tensión de alimentación" unit="V" data={supply} filename="alimentacion" subtitle="Lectura en el conector de cada instrumento." />
+</section>
+
+<section>
+  <div class="section-heading"><h2>Detalle de la última lectura</h2><span>Las consultas de un ciclo son secuenciales, no simultáneas</span></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Instrumento</th><th>Rol</th><th>Magnitud principal</th><th>Temperatura</th><th>RTT</th><th>Flags</th><th>Calidad</th><th>QC</th><th>Cenit</th><th>Hora local</th></tr></thead>
+    <tbody>
+      {#each latest as s (s.address)}
+        <tr>
+          <td><strong>{s.label}</strong> {s.sensor_type === 'pyrgeometer' ? 'SGR4' : 'SMP'}</td>
+          <td>{ROLE_NAMES[s.role]}</td>
+          <td>{format(s.measurement)} W/m²</td>
+          <td>{format(s.body_temp_c)} °C</td>
+          <td>{format(s.rtt_ms)} ms</td>
+          <td title={s.error || 'Máscara de estado'}>{s.status === null ? '—' : `0x${s.status.toString(16).padStart(4, '0')}`}</td>
+          <td><span class="quality" class:bad={!s.valid || stale(s)}>{!s.ok ? 'Sin respuesta' : stale(s) ? 'Desactualizada' : s.valid ? 'Válida' : 'Inválida'}</span>{#if s.error}<small class="sample-error">{s.error}</small>{/if}</td>
+          <td><span class="qc {s.qc.summary}">{QC_TEXT[s.qc.summary]}</span>{#if failedTests(s).length}<small class="sample-error">Falla: {failedTests(s).join(', ')}</small>{/if}{#each s.qc.notes as note}<small class="note">{note}</small>{/each}</td>
+          <td>{s.solar_zenith_deg === null ? '—' : `${format(s.solar_zenith_deg, 1)}°`}</td>
+          <td>{localDate(s.time_utc)}</td>
+        </tr>
+      {:else}<tr><td colspan="10" class="table-empty">No hay lecturas todavía.</td></tr>{/each}
+    </tbody>
+  </table></div>
+</section>
+<div class="bottom"><span>Radiometría · SMP22x + SGR4 · SOLYS2</span><span>Ciclo {run?.status.cycle ?? '—'} · Puerto perdido {run?.status.port_errors ?? 0} veces · {rows.length} puntos en pantalla</span></div>
+
 <style>
-  :global(*) { box-sizing: border-box; } :global(body) { margin: 0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; background: #f3f6f5; color: #223d44; font-size: 13px; }
-  :global(button), :global(select) { font: inherit; } :global(:focus-visible) { outline: 2px solid #3a9b8c; outline-offset: 3px; }
-  .app { display: flex; min-height: 100vh; } aside { width: 226px; background: #142a31; color: #e2eeee; padding: 32px 20px; position: fixed; inset: 0 auto 0 0; display: flex; flex-direction: column; }
-  .brand { display: flex; gap: 12px; align-items: center; font-size: 13px; font-weight: 700; letter-spacing: 1.3px; margin-bottom: 55px; }.brand-icon { font-size: 33px; color: #bdcf85; font-weight: 400; }.brand small { display: block; font-size: 8px; letter-spacing: 1.9px; color: #93a9ad; margin-top: 5px; }
-  .section-label { color: #759197; font-size: 9px; letter-spacing: 1.4px; margin-bottom: 16px; }.nav-active { background: #244149; border: 1px solid #34535a; border-radius: 6px; margin: 0 -5px; padding: 13px 10px; font-size: 12px; }.nav-active span { color: #abd3b4; padding-right: 6px; }.side-description { margin: 16px 8px; color: #7f9a9f; font-size: 11px; line-height: 1.8; }.equipment { border-top: 1px solid #29434a; padding-top: 28px; margin-top: 28px; }.equipment p { font-size: 12px; padding-bottom: 14px; }.equipment small { display: block; color: #819ca1; font-size: 10px; padding: 6px 0 0 15px; }
-  i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 7px; }.blue { background: #447ec4; }.orange { background: #d67c2e; }.green { background: #1d8a76; }.local { margin-top: auto; padding-top: 40px; font-size: 10px; color: #b8ced1; }.local>span { color: #80b49e; padding-right: 5px; }.local small { display: block; color: #67858c; font-size: 9px; margin-top: 7px; }
-  main { margin-left: 226px; padding: 0 36px; width: calc(100% - 226px); max-width: 1850px; }header { height: 66px; border-bottom: 1px solid #dfe7e5; display: flex; align-items: center; justify-content: space-between; }.breadcrumb { font-size: 11px; color: #879b9e; }.breadcrumb span { padding: 0 12px; color: #b4c1c2; }.local-pill { border: 1px solid #dce5e2; padding: 5px 9px; border-radius: 4px; font-size: 8px; letter-spacing: 1px; color: #6b8586; }
-  .title-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 30px 0 24px; }.eyebrow { color: #82958f; font-size: 9px; letter-spacing: 1.8px; }h1 { font-size: 29px; font-weight: 550; letter-spacing: -.9px; margin: 8px 0; }.title-row p { color: #819498; font-size: 12px; margin: 0; }.connection { font-size: 10px; white-space: nowrap; color: #87999d; }.connection i { background: #9aabad; }.connection.active { color: #31826f; }.connection.active i { background: #3a9f80; box-shadow: 0 0 0 4px #dfefe7; }
-  .toolbar { background: #eaf0ed; border: 1px solid #dbe4df; border-radius: 7px; padding: 13px 16px; display: flex; align-items: center; gap: 20px; justify-content: space-between; margin-bottom: 22px; }label { font-size: 8px; color: #83978e; letter-spacing: 1px; display: flex; align-items: center; gap: 12px; } select { background: transparent; border: none; max-width: 340px; color: #315047; font-size: 11px; padding: 5px; }.run-meta { display: flex; align-items: center; gap: 16px; font-size: 10px; color: #7a8f85; }.run-meta strong { background: #e4e9d4; color: #7d863f; padding: 4px 6px; border-radius: 3px; font-size: 8px; letter-spacing: .8px; }
-  .notice { border: 1px solid #e0d5b2; background: #fff9e9; color: #827140; border-radius: 6px; padding: 12px 16px; margin-bottom: 18px; font-size: 12px; }.notice.error { background: #fff2ef; border-color: #efd7d0; color: #a25f4e; }.notice small { display: block; margin-top: 5px; font-family: monospace; }
-  .cards { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 14px; }.value-card { background: #fff; border: 1px solid #dce3e3; border-radius: 9px; padding: 18px; }.card-label { display: flex; justify-content: space-between; gap: 4px; font-size: 9px; color: #657f83; }.card-label>span+span { font-size: 7px; color: #8c9d99; }.value-card h2 { font-size: 11px; font-weight: 400; margin: 16px 0 8px; color: #82989b; }.reading { font-size: 31px; letter-spacing: -1.2px; font-variant-numeric: tabular-nums; }.reading>span { font-size: 11px; margin-left: 8px; color: #879c9e; letter-spacing: 0; }footer { font-size: 8px; color: #8da09e; margin-top: 14px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; }footer small { display: block; font-size: 8px; }.old .reading { color: #98a3a4; }.compare { background: #f0f2eb; border-color: #dce2d3; }.compare .reading { color: #657357; }
-  .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 26px 0 14px; }.section-heading h2 { font-size: 14px; font-weight: 600; margin: 0; }.section-heading span { font-size: 9px; color: #8a9c9e; }.charts { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 16px; }.table-wrap { border: 1px solid #dce3e3; border-radius: 8px; overflow: auto; background: white; }table { width: 100%; border-collapse: collapse; font-size: 10px; text-align: left; white-space: nowrap; }th { color: #81969b; font-size: 9px; font-weight: 500; background: #f9fbfa; padding: 13px 16px; }td { padding: 16px; border-top: 1px solid #edf1ef; color: #6e8589; font-variant-numeric: tabular-nums; }td strong { color: #345158; margin-right: 4px; }.quality { border-radius: 4px; background: #e9f3eb; color: #5a8c69; padding: 4px 7px; font-size: 9px; }.quality.bad { background: #fff1d9; color: #9a7b41; }.sample-error { display: block; font-size: 9px; color: #a06551; margin-top: 7px; max-width: 200px; white-space: normal; }.table-empty { text-align: center; padding: 30px; }.bottom { display: flex; justify-content: space-between; color: #98a9a7; font-size: 9px; padding: 24px 0; gap: 10px; }
-  @media(min-width:1600px) { main { padding: 0 55px; } }@media(max-width:1150px) { aside { width: 190px; padding-inline: 14px; }main { margin-left: 190px; width: calc(100% - 190px); padding: 0 22px; }.cards { grid-template-columns: repeat(2,minmax(0,1fr)); }.run-meta>span:first-child { display: none; } }@media(max-width:760px) { aside { display: none; }main { margin-left: 0; width: 100%; padding: 0 16px; }.charts { grid-template-columns: 1fr; }.title-row { align-items: flex-start; flex-direction: column; gap: 12px; }h1 { font-size: 25px; }.toolbar { align-items: flex-start; flex-direction: column; gap: 8px; }select { max-width: 240px; }.section-heading { align-items: flex-start; flex-direction: column; gap: 6px; }.bottom { flex-direction: column; }.value-card { padding: 13px; }.reading { font-size: 26px; }.card-label { flex-direction: column; } }
+  .connection { font-size: 11px; white-space: nowrap; color: #87999d; display: flex; align-items: center; gap: 8px; }
+  .connection i { width: 7px; height: 7px; border-radius: 50%; background: #9aabad; }
+  .connection.active { color: #31826f; }
+  .connection.active i { background: #3a9f80; box-shadow: 0 0 0 4px #dfefe7; }
+  .toolbar { background: #eaf0ed; border: 1px solid #dbe4df; border-radius: 7px; padding: 10px 14px; display: flex; align-items: center; gap: 16px; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; }
+  .run-meta { display: flex; align-items: center; gap: 14px; font-size: 11px; color: #6f857b; flex-wrap: wrap; }
+  .run-meta b { background: #e4e9d4; color: #6b743a; padding: 3px 6px; border-radius: 3px; font-size: 9px; letter-spacing: .8px; font-weight: 600; }
+  .run-meta b.sim { background: #efe4cf; color: #8a6a2b; }
+  .history-link { font-size: 11px; color: #2f6f62; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+  .value-card { background: #fff; border: 1px solid #dce3e3; border-radius: 9px; padding: 16px; }
+  .card-label { display: flex; justify-content: space-between; gap: 6px; font-size: 9px; color: #657f83; }
+  .card-label i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
+  .card-label > span + span { font-size: 8px; color: #8c9d99; letter-spacing: .5px; }
+  .value-card h2 { font-size: 11px; font-weight: 400; margin: 14px 0 6px; color: #7d9396; }
+  .reading { font-size: 30px; letter-spacing: -1.2px; font-variant-numeric: tabular-nums; }
+  .reading.small { font-size: 22px; }
+  .reading > span { font-size: 11px; margin-left: 8px; color: #879c9e; letter-spacing: 0; }
+  .value-card footer { font-size: 9px; color: #7f9390; margin-top: 12px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; align-items: center; }
+  .value-card footer small { display: block; font-size: 8px; width: 100%; }
+  .value-card footer a { color: #2f6f62; }
+  .old .reading { color: #98a3a4; }
+  .compare { background: #f0f2eb; border-color: #dce2d3; }
+  .info { background: #f2f5f6; }
+  .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+  .quality { border-radius: 4px; background: #e9f3eb; color: #5a8c69; padding: 3px 7px; font-size: 9px; }
+  .quality.bad { background: #fff1d9; color: #9a7b41; }
+  .sample-error { display: block; font-size: 9px; color: #a06551; margin-top: 6px; max-width: 220px; white-space: normal; }
+  .note { display: block; font-size: 9px; color: #7d8f92; margin-top: 4px; max-width: 220px; white-space: normal; }
+  .table-empty { text-align: center; padding: 26px; }
+  .bottom { display: flex; justify-content: space-between; color: #98a9a7; font-size: 9px; padding: 20px 0; gap: 10px; flex-wrap: wrap; }
+  @media (max-width: 1100px) { .charts { grid-template-columns: 1fr; } }
 </style>

@@ -3,8 +3,13 @@
   ports                      lista los puertos COM (el PMU485 aparece como FTDI)
   scan                       busca sensores en un rango de direcciones
   info                       identifica los sensores y hace una lectura completa
-  log                        adquisición continua a CSV (+ gráficas al terminar)
+  log                        adquisición continua a SQLite y CSV (+ gráficas al terminar)
   plot <carpeta|csv>         genera las gráficas de una prueba guardada
+  dashboard                  API y dashboard local (no consulta Modbus)
+  export / backup            CSV de una corrida / copia consistente de la BD
+  ventana                    ventana liviana sin navegador (último minuto y CSV)
+  migrate                    convierte una BD de esquema 1 al esquema 2
+  archive                    archiva días cerrados en Parquet y aplica la retención
 """
 
 from __future__ import annotations
@@ -63,6 +68,16 @@ SIMULATED_ADDRESSES = [2, 3, 4]
 SIMULATED_PYRGEOMETERS = [2]
 
 
+def simulation_options(env: dict[str, str]) -> dict:
+    """Sitio, bola de sombra y seguidor del simulador (SMP_SIM_*)."""
+    from .simulator import DEFAULT_SITE
+    site = tuple(float(env.get(k, str(v))) for k, v in zip(("SMP_SIM_LAT", "SMP_SIM_LON", "SMP_SIM_ALT"), DEFAULT_SITE))
+    if not (-90 <= site[0] <= 90 and -180 <= site[1] <= 180):
+        raise ValueError("SMP_SIM_LAT/SMP_SIM_LON fuera de rango")
+    return {"site": site, "shaded": [int(x) for x in env.get("SMP_SIM_SHADED", "").split()],
+            "tracker_active": env.get("SMP_SIM_TRACKER", "1").lower() in {"1", "true", "yes"}}
+
+
 def _open_bus(args, baud: int | None = None, parity: str | None = None):
     """Abre el bus con los parámetros de args, o con baud/parity si se indican
     (cmd_scan prueba varias combinaciones sin tocar args)."""
@@ -71,7 +86,8 @@ def _open_bus(args, baud: int | None = None, parity: str | None = None):
     if args.simulate:
         from .simulator import SimulatedBus
         return SimulatedBus(SIMULATED_ADDRESSES, baudrate=baud, parity=parity,
-                            timeout=args.timeout, pyrgeometers=SIMULATED_PYRGEOMETERS)
+                            timeout=args.timeout, pyrgeometers=SIMULATED_PYRGEOMETERS,
+                            **simulation_options(environment()))
     port = autodetect_port() if args.port == "auto" else args.port
     return SerialBus(port, baudrate=baud, parity=parity, timeout=args.timeout)
 
@@ -225,6 +241,8 @@ def cmd_log(args) -> int:
         raise ValueError("Duración debe ser positiva y finita")
     if not math.isfinite(args.diag_every) or args.diag_every <= 0:
         raise ValueError("diag-every debe ser positivo y finito")
+    if args.retention_days < 0 or args.clock_check_every < 10 or args.clock_max_offset <= 0:
+        raise ValueError("retention-days >= 0, clock-check-every >= 10 s y clock-max-offset > 0")
     blocks = [
         reg.PYRGEOMETER_BLOCK_COUNT if t == reg.PYRGEOMETER else reg.FAST_BLOCK_COUNT
         for t in types.values()
@@ -243,6 +261,12 @@ def cmd_log(args) -> int:
         simulated=args.simulate,
         live=not args.quiet,
         db_path=Path(args.db),
+        ntp_server=args.ntp_server,
+        clock_check_s=args.clock_check_every,
+        clock_max_offset_s=args.clock_max_offset,
+        archive_dir=None if args.no_archive else Path(args.archive_dir or Path(args.db).with_name("archive")),
+        retention_days=args.retention_days,
+        summary_every_s=args.resumen if args.resumen and args.resumen > 0 else 0,
     )
     try:
         run_dir = Acquisition(bus, cfg).run()
@@ -273,9 +297,52 @@ def cmd_dashboard(args) -> int:
     import uvicorn
     from dataclasses import replace
     from .api import create_app
-    cfg = replace(settings(), db=Path(args.db))
-    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, workers=1)
+    from .config import is_loopback
+    base = settings()
+    observatory = base.observatory if "SMP_OBSERVATORY_DB" in environment() else Path(args.db).with_name("observatory.sqlite3")
+    archive = base.archive_dir if "SMP_ARCHIVE_DIR" in environment() else Path(args.db).with_name("archive")
+    cfg = replace(base, db=Path(args.db), observatory=observatory, archive_dir=archive)
+    if not is_loopback(cfg.host) and not cfg.container_loopback:
+        raise ValueError(
+            f"SMP_API_HOST={cfg.host} expondría el dashboard a la red sin autenticación. "
+            "Use 127.0.0.1; en contenedores publicados solo en loopback, SMP_CONTAINER_LOOPBACK=1.")
+    texto = environment().get("SMP_LOG_FORMAT", "texto").lower() == "texto"
+    if texto:
+        print(f"Dashboard en http://{cfg.host}:{cfg.port}  (Ctrl+C para salir; trazas en data/logs/dashboard.jsonl)",
+              flush=True)
+    # En formato texto, sin una línea por pedido HTTP.
+    uvicorn.run(create_app(cfg), host=cfg.host, port=cfg.port, workers=1,
+                access_log=not texto, log_level="warning" if texto else "info")
     return 0
+
+
+def cmd_ventana(args) -> int:
+    from .ventana import run
+    db = Path(args.db)
+    run(db, Path(args.archive_dir or db.with_name("archive")))
+    return 0
+
+
+def cmd_migrate(args) -> int:
+    from .storage import migrate
+    report = require(migrate(Path(args.db)))
+    if report["status"] == "already_current":
+        print("La base ya está en el esquema 2; no se hizo nada.")
+    else:
+        print(f"Migrada: {report['runs']} corridas, {report['samples']} muestras, {report['minutes']} minutos.")
+        print(f"Copia previa sin modificar: {report['backup']}")
+    return 0
+
+
+def cmd_archive(args) -> int:
+    from .archive import run_once
+    report = require(run_once(Path(args.db), Path(args.archive_dir or Path(args.db).with_name("archive")),
+                              args.retention_days))
+    print(f"Días archivados: {', '.join(report['archived']) or 'ninguno'}")
+    print(f"Días retirados de la base activa: {', '.join(report['pruned']) or 'ninguno'}")
+    for failure in report["failed"]:
+        print(f"  aviso: {failure['day']}: {failure['error']}")
+    return 1 if report["failed"] else 0
 
 
 def cmd_export(args) -> int:
@@ -324,9 +391,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--label", default="", help="etiqueta para el nombre de la carpeta")
     p.add_argument("--no-clear", action="store_true", help="no enviar IO_CLEAR_ERROR")
     p.add_argument("--no-plot", action="store_true", help="no generar gráficas al terminar")
-    p.add_argument("--quiet", "-q", action="store_true", help="no imprimir cada ciclo")
+    p.add_argument("--quiet", "-q", action="store_true", help="no imprimir cada ciclo (solo avisos y errores)")
+    p.add_argument("--resumen", type=float, default=0, metavar="N",
+                   help="imprimir una línea de promedios cada N s en lugar de una por ciclo")
     p.add_argument("--db", default="data/acquisition.sqlite3", help="SQLite compartido con dashboard")
+    p.add_argument("--ntp-server", help="servidor NTP para comprobar el reloj (vacío: no comprobar)")
+    p.add_argument("--clock-check-every", type=float, help="segundos entre comprobaciones del reloj (600)")
+    p.add_argument("--clock-max-offset", type=float, help="desfase de reloj tolerado en s (1)")
+    p.add_argument("--archive-dir", help="carpeta del archivo Parquet (junto a la BD por defecto)")
+    p.add_argument("--retention-days", type=int, help="días de muestras de 1 s en la base activa (30; 0 = no podar)")
+    p.add_argument("--no-archive", action="store_true", help="no archivar en Parquet ni podar")
     p.set_defaults(func=cmd_log)
+
+    p = sub.add_parser("ventana", help="ventana liviana (Tkinter): último minuto, últimos valores y CSV")
+    p.add_argument("--db", default="data/acquisition.sqlite3")
+    p.add_argument("--archive-dir", help="carpeta del archivo Parquet (junto a la BD por defecto)")
+    p.set_defaults(func=cmd_ventana)
+
+    p = sub.add_parser("migrate", help="convierte una BD de esquema 1 al esquema 2 (adquisición detenida)")
+    p.add_argument("--db", default="data/acquisition.sqlite3")
+    p.set_defaults(func=cmd_migrate)
+
+    p = sub.add_parser("archive", help="archiva días cerrados en Parquet y poda la base (adquisición detenida)")
+    p.add_argument("--db", default="data/acquisition.sqlite3")
+    p.add_argument("--archive-dir", help="carpeta del archivo Parquet (junto a la BD por defecto)")
+    p.add_argument("--retention-days", type=int, help="días de muestras de 1 s en la base activa (30)")
+    p.set_defaults(func=cmd_archive)
 
     p = sub.add_parser("plot", help="grafica una prueba guardada")
     p.add_argument("path", help="carpeta de la prueba o su raw_1s.csv")
@@ -360,8 +450,16 @@ def build_parser() -> argparse.ArgumentParser:
         sub.choices[name].set_defaults(addresses=[int(x) for x in e.get("SMP_ADDRESSES", "2 3 4").split()],
             pyrgeometers=[int(x) for x in e.get("SMP_PYRGEOMETERS", "2").split()])
     sub.choices["log"].set_defaults(interval=float(e.get("SMP_INTERVAL_S", "1")),
-        out=e.get("SMP_OUT_DIR", "data"), label=e.get("SMP_LABEL", ""))
-    for name in ("log", "dashboard", "export", "backup"):
+        out=e.get("SMP_OUT_DIR", "data"), label=e.get("SMP_LABEL", ""),
+        ntp_server=e.get("SMP_NTP_SERVER", "pool.ntp.org"),
+        clock_check_every=float(e.get("SMP_CLOCK_CHECK_S", "600")),
+        clock_max_offset=float(e.get("SMP_CLOCK_MAX_OFFSET_S", "1")))
+    for name in ("log", "archive"):
+        sub.choices[name].set_defaults(archive_dir=e.get("SMP_ARCHIVE_DIR"),
+                                       retention_days=int(e.get("SMP_RETENTION_DAYS", "30")))
+    sub.choices["ventana"].set_defaults(archive_dir=e.get("SMP_ARCHIVE_DIR"))
+    sub.choices["log"].set_defaults(resumen=float(e.get("SMP_CONSOLE_SUMMARY_S", "0")))
+    for name in ("log", "dashboard", "export", "backup", "migrate", "archive", "ventana"):
         sub.choices[name].set_defaults(db=e.get("SMP_DB_PATH", "data/acquisition.sqlite3"))
     return parser
 
@@ -371,8 +469,14 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     try:
-        configure_logging(environment().get("SMP_LOG_LEVEL", "INFO"))
+        e = environment()
         args = build_parser().parse_args(argv)
+        fmt = e.get("SMP_LOG_FORMAT", "texto").lower()
+        if fmt not in {"texto", "json"}:
+            raise ValueError("SMP_LOG_FORMAT debe ser texto o json")
+        log_dir = Path(e.get("SMP_LOG_DIR") or Path(e.get("SMP_DB_PATH", "data/acquisition.sqlite3")).with_name("logs"))
+        configure_logging(e.get("SMP_LOG_LEVEL", "WARNING" if fmt == "texto" else "INFO"), fmt,
+                          str(log_dir / f"{args.command}.jsonl") if fmt == "texto" else None)
         if args.command == "log":
             import signal
             def stop(signum, frame):

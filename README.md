@@ -7,12 +7,39 @@ un **PMU485 Smart Setup Hub** (0382460) enchufado por USB al PC:
 |---|---|---|
 | **2** | Pirgeómetro **SGR4** | Radiación de onda larga descendente Ld↓ (infrarrojo del cielo), W/m² |
 | **3** | Piranómetro **SMP22x** (0374960) | Irradiancia global de onda corta, W/m² |
-| **4** | Piranómetro **SMP22x** (0374960) | Irradiancia global de onda corta, W/m² |
+| **4** | Piranómetro **SMP22x** (0374960) | Irradiancia global; **difusa** si se monta bajo la bola de sombra del SOLYS2 |
 
-La adquisición Python guarda las muestras en **SQLite** y produce CSV/PNG
-compatibles. Otro proceso **FastAPI** consulta SQLite y sirve el dashboard
+La adquisición Python guarda las muestras en **SQLite** (columnas tipadas, con
+las palabras Modbus originales), comprueba el reloj por SNTP y archiva cada día
+en **Parquet**. Otro proceso **FastAPI** consulta los datos y sirve el dashboard
 **SvelteKit**, instalado y compilado con **Bun**. Cerrar la web no detiene las
-mediciones. La UI es de solo lectura.
+mediciones.
+
+Para la mini-PC hay además una **ventana liviana** sin navegador
+(`python -m smp22x ventana`, o `make run-ligero` junto con la adquisición): el
+último minuto de los tres sensores, sus últimos valores y la descarga de CSV,
+con unos 30 MB de RAM. No considera el SOLYS2.
+
+El dashboard completo ofrece:
+
+- **Monitor** en vivo del último minuto, con gráficos interactivos y control de
+  calidad por lectura (límites BSRN, cociente difusa/global, sombreado y
+  comparación entre instrumentos del mismo rol).
+- **Histórico y descargas**: cualquier intervalo, carpet plot, CSV o ZIP con
+  metadatos y figuras PNG generadas a pedido.
+- **Instrumentos**: identificación leída de cada equipo y configuración
+  versionada (sitio, SOLYS2 en uso, bola de sombra, umbrales).
+- **Bitácora y eventos**: notas del observatorio y línea de tiempo de flags,
+  puerto, reloj y archivo.
+- **Documentación** para físicos de instrumentación, sin internet.
+
+La web nunca cambia mediciones ni escribe en los sensores: solo guarda la
+configuración y la bitácora en una base aparte. Escucha solo en localhost.
+
+> **Actualizar desde la versión 1:** con la adquisición y la web detenidas,
+> `python -m smp22x migrate` (o `make migrate`) convierte `data/acquisition.sqlite3`
+> al esquema 2 y deja una copia previa sin modificar. Ver
+> [operación](docs/operacion-dashboard.md#4b-actualizar-una-instalación-existente-esquema-1--2).
 
 ## Arranque del dashboard
 
@@ -77,15 +104,21 @@ Docker también sirve el frontend compilado en el puerto 8050 por defecto.
 
 La [especificación SDD](docs/sdd/spec.md), su [diseño](docs/sdd/design.md) y la
 [evidencia de tests](docs/sdd/tasks.md) describen requisitos, casos límite y
-validación. `make check` y `make test` ejecutan verificaciones de frontend/backend.
+validación. `make check` y `make test` ejecutan verificaciones de frontend/backend;
+`make test-e2e`, `make test-perf` y `make test-hardware` cubren navegador,
+volumen y bus real.
+
+Quienes miden encuentran la [documentación para físicos](docs/fisicos/01-inicio.md)
+también dentro del dashboard, en **Documentación**.
 
 ### Qué se hace con la medida
 
 Se interpretan signo y escalas de los enteros según el manual para convertirlos
 a W/m², °C o V. **La medida principal se expresa como la entrega el sensor en
 esas unidades, sin una corrección adicional del programa.** Se guardan también
-palabras originales en SQLite. Por separado se calculan promedios, diferencias
-y la comprobación SGR `neta + σT⁴`, que nunca sustituye a Ld↓ leído. Véase el
+palabras originales en SQLite. Por separado se calculan promedios, diferencias,
+la comprobación SGR `neta + σT⁴`, la posición solar, las pruebas de calidad y
+la DNI estimada; ninguno sustituye ni modifica el valor leído. Véase el
 [tratamiento de datos](docs/tratamiento-datos.md).
 
 Documentación oficial en [`references/`](references/):

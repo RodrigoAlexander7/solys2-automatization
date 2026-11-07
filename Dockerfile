@@ -3,6 +3,8 @@ WORKDIR /build
 COPY frontend/package.json frontend/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY frontend/ ./
+# La documentación para físicos (../docs/fisicos) se compila dentro del frontend.
+COPY docs/fisicos/ /docs/fisicos/
 RUN bun run check && bun run test && bun run build
 
 FROM python:3.13-slim AS runtime

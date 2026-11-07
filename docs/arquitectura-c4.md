@@ -19,6 +19,9 @@ de arranque en [operación](operacion-dashboard.md), conversiones en la
 | WAL | Modo SQLite que admite lectores mientras escribe la adquisición |
 | SSE | Conexión HTTP que lleva novedades desde FastAPI al navegador |
 | Build estático | Archivos de SvelteKit que FastAPI sirve; no hay proceso Bun en producción |
+| Rol | Qué mide una lectura según el montaje vigente: GHI, DHI, LWD o sombra no garantizada |
+| Versión de configuración | Estado del observatorio con fecha de vigencia; nunca se reescribe |
+| Evento | Cambio de estado observado (flags, puerto, reloj, archivo), no una medición |
 
 ## C4 nivel 1: contexto
 
@@ -39,24 +42,32 @@ del perfil SGR4 antiguo sigue pendiente de confirmación de laboratorio.
 ```mermaid
 flowchart LR
   subgraph pc["PC Windows o Linux"]
-    acq["Proceso Python: log<br/>Modbus, conversión, calidad"]
-    db[("SQLite WAL<br/>runs y samples")]
-    api["Proceso Python: dashboard<br/>FastAPI, consultas y SSE"]
+    acq["Proceso Python: log<br/>Modbus, conversión, validez, eventos"]
+    db[("SQLite WAL esquema 2<br/>runs, samples, minutes, events")]
+    arch[("Parquet diario<br/>archive/AAAA/MM")]
+    obs[("SQLite observatorio<br/>configuración y bitácora")]
+    api["Proceso Python: dashboard<br/>FastAPI, QC, SSE, exportación"]
     browser["Navegador<br/>SvelteKit compilado con Bun"]
+    light["Proceso Python: ventana<br/>Tkinter, último minuto y CSV"]
+    db -->|"lectura cada 1 s; nada si está minimizada"| light
     files[("CSV, JSON y PNG")]
     acq -->|"escritor único, commit de ciclo"| db
+    acq -->|"hilo de archivo; poda verificada"| arch
     db -->|"conexiones de lectura"| api
+    arch -->|"lectura de días podados"| api
+    api -->|"escritor único"| obs
     api -->|"HTTP, assets y SSE"| browser
-    browser -->|"GET, selección y filtros"| api
+    browser -->|"GET; POST JSON con Origin local"| api
     acq -->|"proyección tras commit"| files
-    db -->|"exportación reproducible"| files
   end
-  sensors["SGR4 + SMP22x"] -->|"PMU485, COM, Modbus"| acq
+  sensors["SGR4 + SMP22x<br/>(SOLYS2 con bola de sombra)"] -->|"PMU485, COM, Modbus"| acq
+  ntp["Servidor NTP"] -.->|"SNTP, solo medición del desfase"| acq
 ```
 
 FastAPI no abre COM ni inicia adquisición. Al reiniciarlo, `log` sigue escribiendo.
-SQLite no es un servicio adicional: es un archivo y una biblioteca embebida.
-La web de esta versión es de lectura. Docker dispone dos contenedores con los
+SQLite no es un servicio adicional: es un archivo y una biblioteca embebida. Cada
+almacén tiene un único escritor: la adquisición para mediciones y archivo, la
+web para configuración y bitácora. Docker dispone dos contenedores con los
 mismos procesos; el uso nativo sigue disponible para la mini-PC Windows.
 
 ## C4 nivel 3: componentes
@@ -70,25 +81,41 @@ flowchart TB
   sensor --> bus{{ModbusBus}}
   serial["transport.py: SerialBus"] -.-> bus
   sim["simulator.py: SimulatedBus"] -.-> bus
+  acq --> events["events.py<br/>flags, silencio, modo"]
+  acq --> minutes["minutes.py<br/>promedios de 1 min"]
+  acq --> clock["clock.py<br/>SNTP en hilo aparte"]
+  acq --> archive["archive.py<br/>Parquet, verificación, poda"]
   acq --> writer["storage.py: Writer<br/>lock SO y transacciones"]
   writer --> db[(SQLite)]
-  db --> reader["storage.py: Reader<br/>histórico, backup y export"]
-  reader --> api
-  api --> metrics["metrics.py<br/>comparación derivada"]
-  api --> ui["frontend/<br/>SvelteKit y gráficos SVG"]
+  db --> reader["storage.py: Reader<br/>histórico, backup, migración"]
+  reader --> history["history.py<br/>base activa + Parquet"]
+  history --> api
+  api --> analysis["analysis.py<br/>roles, QC, derivados"]
+  analysis --> qc["qc.py + solar.py<br/>BSRN, proyecto, posición solar"]
+  api --> obs["observatory.py<br/>configuración y bitácora"]
+  api --> export["exporting.py + plotting.py<br/>CSV, ZIP y PNG a pedido"]
+  api --> ui["frontend/<br/>SvelteKit, uPlot, carpet, docs"]
   common["result.py, tracing.py, config.py<br/>fallos tipados, contexto y entorno"] -.-> acq
   common -.-> api
-  plot["plotting.py<br/>análisis de CSV y PNG"] --> csv[(CSV exportado)]
 ```
 
 | Componente | Responsabilidad |
 |---|---|
 | `sensor.py` | Interpretar enteros según el perfil; preservar palabras originales; no recalibrar |
-| `acquisition.py` | Planificar y secuenciar; confirmar ciclo antes de CSV; detener ante error de almacenamiento |
-| `storage.py` | Único escritor con lock de SO; esquema versionado; lectores cortos y backup consistente |
-| `api.py` | Validar filtros; mapear errores; servir muestras confirmadas; no entregar tracebacks al navegador |
-| `frontend/src/lib/data.ts` | Result de cliente, deduplicación y buffer acotado; datos ausentes no son cero |
-| `Chart.svelte` | Gráficas SVG locales sin CDN; interrupciones de línea para inválidos y huecos |
+| `acquisition.py` | Planificar y secuenciar; confirmar ciclo (muestras, minutos, eventos) antes de CSV; detener ante error de almacenamiento |
+| `events.py` | Convertir cambios de estado en eventos con límite de frecuencia |
+| `clock.py` | Medir el desfase del reloj por SNTP sin tocarlo |
+| `storage.py` | Esquema 2 tipado; único escritor; lectores cortos; migración verificada; backup |
+| `archive.py` / `history.py` | Parquet diario verificado y poda segura; consultas que unen ambas fuentes |
+| `observatory.py` | Versiones de configuración y bitácora de solo agregar |
+| `analysis.py`, `qc.py`, `solar.py` | Rol vigente en cada instante, pruebas BSRN y del proyecto, DNI estimada; nunca modifican valores |
+| `api.py` | Validar filtros; proteger Host/Origin; mapear errores; no entregar tracebacks al navegador |
+| `exporting.py` / `plotting.py` | CSV en streaming, ZIP con metadatos y figuras PNG a pedido |
+| `frontend/src/lib/data.ts` | Alineación de series, deduplicación, huecos sin interpolar; ausentes no son cero |
+| `TimeChart.svelte` / `Carpet.svelte` | uPlot sin CDN con cursor sincronizado, zoom y PNG; carpet plot en canvas |
+| `ventana.py` | Interfaz liviana Tkinter: tres consultas por segundo, dibujo en Canvas, exportación CSV clásica |
+| `decimate.py` | Reducir series para dibujar (mínimo y máximo por tramo, huecos explícitos) |
+| `console.py` | Líneas de ciclo, resúmenes y eventos legibles en la terminal |
 | `tracing.py` | JSON con trace_id, cadena de operaciones, duración y contexto permitido |
 
 ## Recorrido de un ciclo
@@ -130,6 +157,11 @@ y difieren dentro del ciclo. Las derivadas y limitaciones científicas están en
 | Proceso muerto abruptamente | Locks del SO liberados; commits completos recuperables; siguiente escritor marca corrida interrumpida |
 | API/navegador cerrado | Adquisición continúa; GET/SSE recuperan por cursor |
 | Mapa/escala desconocidos | Advertencia o muestra inválida según caso; no inventar una conversión |
+| Servidor NTP inaccesible | Evento `clock_unavailable` y aviso; la adquisición sigue |
+| Archivo Parquet alterado o ausente | Evento `archive_failed`; el día no se poda |
+| Filas tardías en un día archivado | El día se reescribe uniendo archivo y base antes de volver a podar |
+| Base de esquema 1 | Adquisición y web se niegan e indican `smp22x migrate` |
+| Pedido con `Host` u `Origin` ajeno | 403; ninguna escritura |
 
 Los bugs previos de baudios, desconexión contada como fallo de sensor y mutación
 de argumentos de scan conservan tests de regresión. Evidencias actuales en

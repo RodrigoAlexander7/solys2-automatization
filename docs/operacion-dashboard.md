@@ -2,10 +2,12 @@
 
 ## 1. Qué se ejecuta
 
-Dos procesos Python: `log` posee Modbus y escribe SQLite; `dashboard` ejecuta
-FastAPI, abre conexiones de lectura y sirve el build SvelteKit. Bun se usa para
-instalar, probar y construir frontend. En producción no hay servidor Bun/Node.
-La UI es de lectura; no cambia medidas ni escribe anotaciones.
+Dos procesos Python: `log` posee Modbus, escribe la base de mediciones, comprueba
+el reloj y archiva en Parquet; `dashboard` ejecuta FastAPI, lee las mediciones,
+escribe solo la base del observatorio (configuración y bitácora) y sirve el
+build SvelteKit. Bun se usa para instalar, probar y construir frontend. En
+producción no hay servidor Bun/Node. La web nunca cambia medidas ni escribe en
+los sensores.
 
 Requisitos nativos: Python **3.13**, Bun **1.4**, navegador moderno y, opcionalmente,
 GNU Make. Versiones resueltas: `requirements.lock` y `frontend/bun.lock`. Los
@@ -127,11 +129,93 @@ La web publica solo en loopback del host, puerto 8050 salvo override.
 | SMP_FRONTEND_DIR | Build servido | frontend/build |
 | SMP_LOG_LEVEL | Trazas en stderr | INFO |
 | SMP_DATA_DIR / SMP_DEVICE | Mount/dispositivo en Compose | ./data / /dev/ttyUSB0 |
+| SMP_OBSERVATORY_DB | Configuración versionada y bitácora (escribe la web) | junto a SMP_DB_PATH |
+| SMP_ARCHIVE_DIR | Archivo Parquet diario | junto a SMP_DB_PATH, `archive/` |
+| SMP_RETENTION_DAYS | Días de 1 s en la base activa; 0 = no podar | 30 |
+| SMP_NTP_SERVER | Servidor para comprobar el reloj; vacío = deshabilitado | pool.ntp.org |
+| SMP_CLOCK_CHECK_S / SMP_CLOCK_MAX_OFFSET_S | Frecuencia y umbral de aviso del reloj | 600 s / 1 s |
+| SMP_SIM_LAT / SMP_SIM_LON / SMP_SIM_ALT | Sitio del simulador | referencia NREL SPA (Golden, CO) |
+| SMP_SIM_SHADED / SMP_SIM_TRACKER | Piranómetros simulados con bola de sombra y seguidor activo | vacío / 1 |
+| SMP_ALLOWED_HOSTS | Nombres extra aceptados en `Host` (lista separada por comas) | vacío |
+| SMP_CONTAINER_LOOPBACK | Permite escuchar en 0.0.0.0 dentro de un contenedor publicado en loopback | 0 (Compose: 1) |
 
 Precedencia: CLI > entorno del proceso > `.env` > predeterminados. Los campos
 de conexión/intervalo tienen opciones CLI; host/puerto web se configuran por env.
 La UI no recibe `.env`. Compose cambia ruta interna de BD y host a `0.0.0.0`,
 manteniendo la publicación externa en `127.0.0.1`.
+
+**Sin autenticación:** la web atiende solo pedidos con `Host` local y rechaza
+escrituras sin `Origin` propio o que no sean JSON. Si `SMP_API_HOST` no es
+loopback, `dashboard` se niega a arrancar. Abrirla a la red requiere agregar
+autenticación primero.
+
+| SMP_LOG_FORMAT | `texto` (terminal legible, trazas a archivo) o `json` (formato anterior) | texto |
+| SMP_LOG_LEVEL | Nivel del archivo de trazas: WARNING solo fallos, INFO cada operación | WARNING |
+| SMP_LOG_DIR | Carpeta de `<comando>.jsonl` (5 MB × 5) | junto a SMP_DB_PATH, `logs/` |
+| SMP_CONSOLE_SUMMARY_S | Adquisición: 0 = una línea por ciclo; N = promedios cada N s | 0 |
+
+## 4a. Interfaz liviana y terminal
+
+En la mini-PC conviene usar la ventana liviana en lugar del navegador:
+
+```sh
+make run-ligero              # adquisición + ventana; o por separado:
+make acquire                 # terminal 1
+make ventana                 # terminal 2 (Windows: .venv\Scripts\python -m smp22x ventana)
+```
+
+La ventana usa Tkinter, que trae el instalador oficial de Python para Windows
+(opción «tcl/tk and IDLE», marcada por defecto). Se comprueba con
+`python -m tkinter`. No necesita `dashboard` ni Chrome.
+
+La terminal de la adquisición muestra una línea por ciclo y los eventos:
+
+```
+12:04:31  #2 Ld↓   320,4   #3   812,3   #4   798,1  W/m²   ciclo   62 ms
+12:04:32  #2 Ld↓   320,6   #3   812,0   #4     ---  W/m²   ciclo  361 ms   #4 sin respuesta
+12:05:00  AVISO  #3 flags: activados DESICCANT_WARNING
+```
+
+`--resumen 10` imprime promedios cada 10 s y `--quiet` deja solo avisos y
+errores. Las trazas JSON van a `data/logs/log.jsonl` (y `dashboard.jsonl`,
+`ventana.jsonl`); en la terminal solo aparece lo inesperado, con su código de
+traza para buscarlo en ese archivo.
+
+**Medir el consumo en la mini-PC** (requiere `requirements-dev.txt`):
+
+```sh
+.venv/bin/python scripts/medir_consumo.py --demo --visible --segundos 120
+.venv/bin/python scripts/medir_consumo.py --proceso chrome --segundos 120
+```
+
+La segunda medición suma todos los procesos de Chrome con el dashboard abierto.
+
+## 4b. Actualizar una instalación existente (esquema 1 → 2)
+
+La versión 2 guarda columnas tipadas. Con una base anterior, la adquisición y la
+web se niegan a abrirla e indican el comando. Con **ambos procesos detenidos**:
+
+```sh
+.venv/bin/python -m smp22x migrate          # o: make migrate
+```
+
+Crea primero `acquisition.v1-backup-AAAAMMDD_HHMMSS.sqlite3` sin modificar,
+convierte, recalcula los minutos y compara cada muestra antes de reemplazar el
+archivo. Si algo no coincide, la base original queda intacta.
+
+## 4c. Archivo Parquet y retención
+
+La adquisición archiva sola cada día UTC una hora después de que termina y
+retira de la base activa los días más antiguos que la retención, solo después de
+verificar el archivo. Con la adquisición detenida se puede forzar:
+
+```sh
+.venv/bin/python -m smp22x archive --retention-days 30   # o: make archive
+```
+
+El estado queda en `/api/archive` y en la línea de tiempo (`archive_written`,
+`archive_pruned`, `archive_failed`). Copie `data/archive/` a otro disco: es el
+histórico de 1 s.
 
 ## 5. API, históricos y exportaciones
 
@@ -146,13 +230,29 @@ Contrato interactivo en `/docs`; OpenAPI en `/openapi.json`.
 | /api/runs/{id}/status | Última lectura por equipo, antigüedad y comparación |
 | /api/runs/{id}/minutes | Agregados reconstruidos: número, válidas, media, mínimo/máximo y desviación |
 | /api/runs/{id}/stream | SSE `samples`, `heartbeat`, `failure`; acepta `after_id` y Last-Event-ID |
+| /api/live | Estado de la última corrida: lecturas con rol y QC, comparaciones, reloj, alertas |
+| /api/series | Serie entre corridas por fecha; `resolution` auto (1 s hasta 2 h), `1s` (hasta 6 h) o `1min`; `max_points` reduce cada serie para dibujar (mínimo y máximo por tramo) |
+| /api/minutes | Promedios de minuto con QC (carpet plot), hasta 92 días |
+| /api/instruments | Identificación leída, estadísticas de comunicación, última lectura y configuración |
+| /api/timeline | Eventos de adquisición, bitácora y versiones de configuración, más recientes primero |
+| /api/observatory/config | Configuración vigente, historial y tipos de sensor conocidos |
+| /api/logbook | Notas de la bitácora (incluye anuladas salvo `include_voided=false`) |
+| /api/export | CSV (`format=csv`) o ZIP con metadatos (`format=zip`); `resolution` 1s (≤ 31 días) o 1min (≤ 366); `invalid` include/exclude |
+| /api/export/estimate | Filas y tamaño aproximado antes de descargar |
+| /api/figure | PNG de matplotlib a pedido; no se guarda |
+| /api/clock, /api/archive | Últimas comprobaciones de reloj; manifiesto del archivo |
+
+| POST (solo base del observatorio) | Efecto |
+|---|---|
+| /api/observatory/config | Nueva versión con autor, nota y vigencia; crea entrada de bitácora |
+| /api/logbook | Nueva nota |
+| /api/logbook/{id}/void | Anula una nota con motivo (no la borra) |
 
 Fechas de filtro ISO 8601 con zona. `recent=true` pide las últimas `limit` filas,
 devuelve cursor al final y `history_truncated` si omitió histórico; los GET normales
-usan `has_more` para paginar. La UI carga hasta 3600 filas recientes, luego SSE,
-deduplica por ID y conserva ese límite; muestra una ventana de hasta 15 min.
-Elegir otra corrida permite inspeccionar su tramo final. Consultas de otro tramo
-se hacen por API o CSV; no existe todavía selector temporal completo en la UI.
+usan `has_more` para paginar. El monitor carga solo el último minuto y sigue en
+vivo por SSE deduplicando por ID. El histórico consulta cualquier intervalo
+uniendo base activa y Parquet y pide `max_points=600` para dibujar.
 
 El cursor es de inserción, no de hora. Un dato tardío o una corrección de reloj
 no lo deja fuera de la recuperación. No se mantienen transacciones abiertas
@@ -176,11 +276,22 @@ Backup usa la API SQLite; no copiar solo el `.db` mientras corre WAL.
 make check
 make test
 bun x --cwd frontend playwright install chromium
-make build
-bun run --cwd frontend test:e2e
+make test-e2e
+make test-perf        # incluye 30 días sintéticos (minutos)
+make test-hardware    # bus real, adquisición y SmartExplorer cerrados
 ```
 
+La suite está organizada por niveles: conversión (incluye propiedades con
+`hypothesis`), reglas de QC en sus bordes, geometría solar contra NREL SPA,
+escenarios de falla simulados (domo sucio, desnivel, bola desalineada, SOLYS2
+detenido, offset nocturno, desecante, VOID_DATA, sensor mudo), almacenamiento,
+migración y archivo, configuración, seguridad, API, frontend, rendimiento y
+hardware opcional. El nivel hardware guarda volcados de registros en
+`tests/fixtures/hardware/`, que luego se reconvierten en cada corrida de tests.
+
 E2E crea BD y procesos desechables; no usa el hardware ni la BD de producción.
+Siembra 24 h simuladas antes de arrancar la adquisición en vivo. Para verla a
+mano: `.venv/bin/python scripts/e2e_server.py` y abrir http://127.0.0.1:8061.
 Si ya dispone de Chromium compatible puede fijar `PLAYWRIGHT_CHROMIUM_EXECUTABLE`.
 Capturas de pruebas en `test-results/` (ignoradas por Git).
 
@@ -197,6 +308,7 @@ inesperado responde 500. Errores de sensor se conservan en cada muestra. La
 [skill local](../skills/radiometry-results/SKILL.md) explica cómo mantener ese patrón.
 Fue escrita siguiendo la guía skill-creator; no está instalada globalmente.
 
-Faltan validación de hardware, pruebas sostenidas en la mini-PC y criterios
-científicos para alertas de desviación. El detalle de evidencias está en
-[SDD/tasks](sdd/tasks.md); no se confunden estos pendientes con tests ya ejecutados.
+Faltan validación de hardware, pruebas sostenidas en la mini-PC y validar con
+mediciones reales los umbrales del proyecto (sombreado y comparación). El detalle
+de evidencias está en [SDD/tasks](sdd/tasks.md); no se confunden estos pendientes
+con tests ya ejecutados.

@@ -16,13 +16,18 @@ import json
 import math
 import statistics
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 from typing import TextIO
 
+from . import console
 from . import registers as reg
+from .clock import ClockMonitor, clock_event, clock_status
+from .events import ERROR, INFO, Event, EventTracker, now_ms
+from .minutes import MINUTE_COLUMNS, MinuteAggregator, MinuteRecord, fmt as _fmt
 from .sensor import DeviceInfo, Sample, SMPSensor
 from .transport import BusError, ModbusBus, PortError, read_transaction_wire_time_s
 from .result import require
@@ -35,10 +40,7 @@ RAW_COLUMNS = [
     "body_temp_c", "supply_v", "rh_pct", "pressure_hpa",
     "mode", "status_hex", "status_flags", "valid", "rtt_ms", "error",
 ]
-MINUTE_COLUMNS = [
-    "minute_local", "minute_utc", "address", "sensor_type", "n_samples", "n_valid",
-    "mean_wm2", "min_wm2", "max_wm2", "std_wm2", "net_mean_wm2", "body_temp_c_mean", "complete",
-]
+__all__ = ["Acquisition", "AcquisitionConfig", "RAW_COLUMNS", "MINUTE_COLUMNS", "raw_row"]
 
 BACKOFF_AFTER_FAILURES = 5   # fallos seguidos antes de espaciar las consultas
 BACKOFF_EVERY_CYCLES = 10    # un sensor mudo solo se reintenta cada N ciclos
@@ -59,6 +61,38 @@ class AcquisitionConfig:
     simulated: bool = False
     live: bool = True
     db_path: Path | None = None
+    ntp_server: str = ""              # vacío: sin comprobación de reloj
+    clock_check_s: float = 600.0
+    clock_max_offset_s: float = 1.0
+    archive_dir: Path | None = None   # None: sin archivo Parquet ni poda
+    retention_days: int = 30          # 0: nunca podar la base activa
+    archive_every_s: float = 3600.0
+    summary_every_s: float = 0        # > 0: una línea de promedios cada N s en vez de una por ciclo
+
+
+def raw_row(cycle: int, s: Sample) -> list:
+    return [
+        s.time_utc.isoformat(timespec="milliseconds"),
+        s.time_utc.astimezone().isoformat(timespec="milliseconds"),
+        cycle,
+        s.address,
+        s.sensor_type,
+        _fmt(s.irradiance, 2),
+        _fmt(s.raw_irradiance, 2),
+        _fmt(s.lw_down, 2),
+        _fmt(s.raw_lw_down, 2),
+        _fmt(s.stdev),
+        _fmt(s.body_temp_c),
+        _fmt(s.supply_v),
+        _fmt(s.rh_pct),
+        _fmt(s.pressure_hpa),
+        "" if s.mode is None else s.mode,
+        "" if s.status is None else f"0x{s.status:04X}",
+        "|".join(s.status_names),
+        int(s.valid),
+        _fmt(s.rtt_ms),
+        s.error,
+    ]
 
 
 @dataclass
@@ -74,62 +108,11 @@ class _SensorState:
     flags_seen: set[str] = field(default_factory=set)
 
 
-def _fmt(value: float | None, digits: int = 1) -> str:
-    return "" if value is None else f"{value:.{digits}f}"
-
-
 def _pct(values: list[float], q: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
     return ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))]
-
-
-class _MinuteAggregator:
-    def __init__(self, writer: csv.writer, interval_s: float) -> None:
-        self.writer = writer
-        self.expected = 60.0 / interval_s
-        self.buckets: dict[int, dict] = {}
-
-    def add(self, s: Sample) -> None:
-        minute = s.time_utc.replace(second=0, microsecond=0)
-        bucket = self.buckets.get(s.address)
-        if bucket is not None and bucket["minute"] != minute:
-            self._emit(s.address, bucket)
-            bucket = None
-        if bucket is None:
-            bucket = {"minute": minute, "type": s.sensor_type, "n": 0, "val": [], "net": [], "temp": []}
-            self.buckets[s.address] = bucket
-        bucket["n"] += 1
-        if s.valid:
-            bucket["val"].append(s.measurement)
-            if s.sensor_type == reg.PYRGEOMETER and s.irradiance is not None:
-                bucket["net"].append(s.irradiance)
-            if s.body_temp_c is not None:
-                bucket["temp"].append(s.body_temp_c)
-
-    def _emit(self, address: int, b: dict) -> None:
-        val = b["val"]
-        self.writer.writerow([
-            b["minute"].astimezone().isoformat(timespec="seconds"),
-            b["minute"].isoformat(timespec="seconds"),
-            address,
-            b["type"],
-            b["n"],
-            len(val),
-            _fmt(statistics.fmean(val) if val else None, 2),
-            _fmt(min(val) if val else None),
-            _fmt(max(val) if val else None),
-            _fmt(statistics.pstdev(val) if len(val) > 1 else None, 2),
-            _fmt(statistics.fmean(b["net"]) if b["net"] else None, 2),
-            _fmt(statistics.fmean(b["temp"]) if b["temp"] else None, 2),
-            int(len(val) >= 0.8 * self.expected),
-        ])
-
-    def flush(self) -> None:
-        for address, bucket in self.buckets.items():
-            self._emit(address, bucket)
-        self.buckets.clear()
 
 
 class Acquisition:
@@ -153,6 +136,14 @@ class Acquisition:
         self.run_id = uuid4().hex
         self.writer: Writer | None = None
         self._deadline: float | None = None
+        self.tracker = EventTracker()
+        self.pending_events: list[Event] = []
+        self.clock_monitor: ClockMonitor | None = None
+        self.clock: dict | None = None
+        self.archiver = None
+        self.prune_queue: deque[tuple[str, int, int]] = deque()
+        self.archive_state: dict = {"archived_days": 0, "pruned_days": 0, "last_error": ""}
+        self.summary = console.Summary(cfg.summary_every_s or 10)
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
         name = f"{stamp}_{cfg.label}" if cfg.label else stamp
         if cfg.simulated:
@@ -190,13 +181,17 @@ class Acquisition:
         try:
             sensor.clear_error()
             st.errors_cleared += 1
+            self.pending_events.append(Event(now_ms(), "error_cleared", INFO, sensor.address,
+                                             {"coil": reg.IO_CLEAR_ERROR}))
         except BusError as exc:
             st.last_error = f"clear_error: {exc}"
 
     def _recover_port(self, exc: PortError) -> None:
         self.port_errors += 1
         lost_at = time.monotonic()
+        self.pending_events.append(Event(now_ms(), "port_lost", ERROR, None, {"error": str(exc)}))
         self._log(f"!! Puerto perdido: {exc}. Reintentando cada {PORT_RETRY_S:.0f} s (Ctrl+C para salir)")
+        recovered = False
         try:
             while True:
                 if self._deadline is not None and time.monotonic() >= self._deadline:
@@ -204,12 +199,74 @@ class Acquisition:
                 time.sleep(PORT_RETRY_S)
                 try:
                     self.bus.reopen()
+                    recovered = True
                     self._log("!! Puerto recuperado")
                     return
                 except PortError:
                     continue
         finally:
-            self.port_downtime_s += time.monotonic() - lost_at
+            downtime = time.monotonic() - lost_at
+            self.port_downtime_s += downtime
+            if recovered:
+                self.pending_events.append(Event(now_ms(), "port_recovered", INFO, None,
+                                                 {"downtime_s": round(downtime, 1)}))
+
+    # ------------------------------------------------- reloj, archivo, eventos
+    def _start_background(self) -> None:
+        cfg = self.cfg
+        if cfg.ntp_server:
+            self.clock_monitor = ClockMonitor(cfg.ntp_server, cfg.clock_check_s)
+            self.clock_monitor.start()
+        if cfg.archive_dir is not None and cfg.db_path is not None:
+            from .archive import ArchiveWorker
+            self.archiver = ArchiveWorker(cfg.db_path, cfg.archive_dir, cfg.retention_days, cfg.archive_every_s)
+            self.archiver.start()
+
+    def _stop_background(self) -> None:
+        for worker in (self.clock_monitor, self.archiver):
+            if worker is not None:
+                worker.stop()
+
+    def _collect_background(self) -> None:
+        """Convierte resultados de los hilos en eventos y registros; nunca bloquea el ciclo."""
+        if self.clock_monitor is not None:
+            for check in self.clock_monitor.drain():
+                self.clock = clock_status(check, self.cfg.clock_max_offset_s)
+                self.pending_events.append(clock_event(check, self.cfg.clock_max_offset_s))
+        if self.archiver is None:
+            return
+        for kind, day, payload in self.archiver.drain():
+            if kind == "archived":
+                require(self.writer.record_archive(day, payload.path, payload.rows, payload.sha256))
+                self.archiver.done(day)
+                self.archive_state["archived_days"] += 1
+                self.pending_events.append(Event(now_ms(), "archive_written", INFO, None,
+                                                 {"day": day, "rows": payload.rows, "path": payload.path}))
+            elif kind == "prune_ready":
+                self.prune_queue.append((day, *payload))
+            else:
+                self.archive_state["last_error"] = payload
+                self.pending_events.append(Event(now_ms(), "archive_failed", ERROR, None,
+                                                 {"day": day, "error": payload}))
+
+    def _prune_step(self) -> None:
+        """Poda un lote de un día ya archivado y verificado; el resto en ciclos siguientes."""
+        from .archive import PRUNE_BATCH
+        if not self.prune_queue:
+            return
+        day, start, end = self.prune_queue[0]
+        deleted = require(self.writer.prune_batch(start, end, PRUNE_BATCH))
+        if deleted < PRUNE_BATCH and self.writer.count_range(start, end) == 0:
+            require(self.writer.mark_pruned(day, [Event(now_ms(), "archive_pruned", INFO, None, {"day": day})]))
+            self.prune_queue.popleft()
+            self.archive_state["pruned_days"] += 1
+            if self.archiver is not None:
+                self.archiver.done(day)
+
+    def _take_events(self, t_ms: int) -> list[Event]:
+        events = self.pending_events + self.tracker.tick(t_ms)
+        self.pending_events = []
+        return events
 
     def _aligned_tick(self) -> float:
         """Próximo instante (en reloj monotónico) que cae en un múltiplo exacto del
@@ -276,41 +333,10 @@ class Acquisition:
         self.meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
     def _row(self, cycle: int, s: Sample) -> list:
-        return [
-            s.time_utc.isoformat(timespec="milliseconds"),
-            s.time_utc.astimezone().isoformat(timespec="milliseconds"),
-            cycle,
-            s.address,
-            s.sensor_type,
-            _fmt(s.irradiance, 2),
-            _fmt(s.raw_irradiance, 2),
-            _fmt(s.lw_down, 2),
-            _fmt(s.raw_lw_down, 2),
-            _fmt(s.stdev),
-            _fmt(s.body_temp_c),
-            _fmt(s.supply_v),
-            _fmt(s.rh_pct),
-            _fmt(s.pressure_hpa),
-            "" if s.mode is None else s.mode,
-            "" if s.status is None else f"0x{s.status:04X}",
-            "|".join(s.status_names),
-            int(s.valid),
-            _fmt(s.rtt_ms),
-            s.error,
-        ]
+        return raw_row(cycle, s)
 
     def _live_line(self, samples: list[Sample], cycle_ms: float) -> str:
-        parts = []
-        for s in samples:
-            name = f"#{s.address} Ld↓" if s.sensor_type == reg.PYRGEOMETER else f"#{s.address}"
-            if s.valid:
-                parts.append(f"{name} {s.measurement:7.1f}")
-            elif s.ok:
-                parts.append(f"{name} {'INV':>7}")
-            else:
-                parts.append(f"{name} {'---':>7}")
-        clock = datetime.now().strftime("%H:%M:%S")
-        return f"{clock}  " + "   ".join(parts) + f"  W/m²   ciclo {cycle_ms:5.0f} ms"
+        return console.cycle_line(samples, cycle_ms)
 
     # ------------------------------------------------------------------- run
     @traced("Acquisition.run")
@@ -328,6 +354,7 @@ class Acquisition:
         require(self.writer.open())
         reason = "error"
         initialized = False
+        last_minutes: list[MinuteRecord] = []
         try:
             self._write_meta(started, None, "running")
             require(self.writer.start(self.run_id, json.loads(self.meta_path.read_text())))
@@ -341,14 +368,15 @@ class Acquisition:
             self._write_meta(started, None, "running")
             # Refresh identity metadata before the first cycle.
             require(self.writer.metadata(self.run_id, json.loads(self.meta_path.read_text())))
+            self._start_background()
             with open(self.raw_path, "w", newline="", encoding="utf-8") as raw_f, \
                     open(self.minute_path, "w", newline="", encoding="utf-8") as min_f:
                 raw_w, min_w = csv.writer(raw_f), csv.writer(min_f)
                 raw_w.writerow(RAW_COLUMNS)
                 min_w.writerow(MINUTE_COLUMNS)
-                aggregator = _MinuteAggregator(min_w, cfg.interval_s)
+                aggregator = MinuteAggregator(cfg.interval_s)
                 try:
-                    self._loop(raw_f, raw_w, min_f, aggregator)
+                    self._loop(raw_f, raw_w, min_f, min_w, aggregator)
                     reason = "duration"
                 except TimeoutError:
                     reason = "duration"
@@ -356,18 +384,23 @@ class Acquisition:
                     reason = "ctrl+c"
                     self._log("\nDetenido por el usuario.")
                 finally:
-                    aggregator.flush()
+                    last_minutes = aggregator.flush()
+                    for minute in last_minutes:
+                        min_w.writerow(minute.csv_row())
         finally:
+            self._stop_background()
             try:
                 self._write_meta(started, datetime.now(timezone.utc), reason)
                 if initialized:
-                    require(self.writer.finish(self.run_id, reason, json.loads(self.meta_path.read_text())))
+                    pending = self._take_events(now_ms())
+                    require(self.writer.finish(self.run_id, reason, json.loads(self.meta_path.read_text()),
+                                               minutes=last_minutes, events=pending))
             finally:
                 self.writer.close()
         self._print_summary()
         return self.run_dir
 
-    def _loop(self, raw_f: TextIO, raw_w, min_f: TextIO, aggregator: _MinuteAggregator) -> None:
+    def _loop(self, raw_f: TextIO, raw_w, min_f: TextIO, min_w, aggregator: MinuteAggregator) -> None:
         cfg = self.cfg
         next_tick = self._aligned_tick()
         t_start = next_tick
@@ -397,22 +430,40 @@ class Acquisition:
                     break
                 st.requests += 1
                 self._account(sensor, st, sample)
+                self.pending_events.extend(self.tracker.observe(sample))
                 samples.append(sample)
             cycle_ms = (time.monotonic() - cycle_start) * 1000
+            closed: list[MinuteRecord] = []
+            for sample in samples:
+                closed.extend(aggregator.add(sample))
+            self._collect_background()
             require(self.writer.commit_cycle(self.run_id, cycle, samples, {
                 "cycle": cycle, "cycle_ms": cycle_ms, "port_errors": self.port_errors,
                 "overruns": self.overruns, "port_downtime_s": self.port_downtime_s,
                 "per_sensor": {str(a): {"requests": s.requests, "responses_ok": s.ok,
                     "samples_valid": s.valid, "consecutive_failures": s.consecutive_failures,
                     "comm_errors": s.requests - s.ok} for a, s in self.state.items()},
-            }))
+                "clock": self.clock, "clock_check_enabled": bool(self.cfg.ntp_server),
+                "archive": {**self.archive_state, "enabled": self.archiver is not None,
+                            "retention_days": self.cfg.retention_days, "prune_queue": len(self.prune_queue)},
+            }, minutes=closed, events=(events := self._take_events(now_ms()))))
             for sample in samples:
-                raw_w.writerow(self._row(cycle, sample))
-                aggregator.add(sample)
+                raw_w.writerow(raw_row(cycle, sample))
+            for minute in closed:
+                min_w.writerow(minute.csv_row())
             raw_f.flush()
             min_f.flush()
+            self._prune_step()
             if cfg.live and samples:
-                self._log(self._live_line(samples, cycle_ms))
+                if cfg.summary_every_s > 0:
+                    line = self.summary.add(samples, cycle_ms, time.monotonic())
+                    if line:
+                        self._log(line)
+                else:
+                    self._log(self._live_line(samples, cycle_ms))
+            for event in events:  # ya confirmados en la base
+                if cfg.live or event.severity != "info":
+                    self._log(console.event_line(event))
             cycle += 1
             if port_lost:
                 # El ciclo cortado incluye la reconexión (≥ 2 s): no entra en las
@@ -432,16 +483,10 @@ class Acquisition:
 
     def _account(self, sensor: SMPSensor, st: _SensorState, sample: Sample) -> None:
         if not sample.ok:
+            # El aviso sale como evento sensor_silent / sensor_recovered (una línea legible).
             st.consecutive_failures += 1
             st.last_error = sample.error
-            if st.consecutive_failures == BACKOFF_AFTER_FAILURES:
-                self._log(
-                    f"  aviso: #{sensor.address} no responde ({sample.error}); "
-                    f"se reintentará cada {BACKOFF_EVERY_CYCLES} ciclos"
-                )
             return
-        if st.consecutive_failures >= BACKOFF_AFTER_FAILURES:
-            self._log(f"  #{sensor.address} vuelve a responder")
         st.consecutive_failures = 0
         st.ok += 1
         st.valid += int(sample.valid)
