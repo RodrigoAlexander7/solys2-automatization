@@ -2,13 +2,19 @@
 from datetime import datetime, timezone
 
 
-def comparison(samples: list[dict]) -> dict:
+def comparison(samples: list[dict], a: int | None = None, b: int | None = None) -> dict:
+    """Diferencia entre dos piranómetros válidos del mismo ciclo (por defecto, los dos primeros)."""
     short = {s["address"]: s for s in samples if s["sensor_type"] == "pyranometer" and s["valid"]}
-    a, b = short.get(3), short.get(4)
-    if not a or not b or a["cycle"] != b["cycle"]:
+    addresses = sorted({s["address"] for s in samples if s["sensor_type"] == "pyranometer"})
+    if a is None or b is None:
+        if len(addresses) < 2:
+            return {"difference_wm2": None, "difference_pct": None}
+        a, b = addresses[0], addresses[1]
+    first, second = short.get(a), short.get(b)
+    if not first or not second or first["cycle"] != second["cycle"]:
         return {"difference_wm2": None, "difference_pct": None}
-    difference = a["measurement"] - b["measurement"]
-    mean = (a["measurement"] + b["measurement"]) / 2
+    difference = first["measurement"] - second["measurement"]
+    mean = (first["measurement"] + second["measurement"]) / 2
     return {"difference_wm2": difference,
             "difference_pct": 100 * difference / mean if mean > 100 else None}
 

@@ -8,11 +8,13 @@ irradiancia.png para los piranómetros y onda_larga.png para el pirgeómetro.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
+logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 
 import matplotlib.dates as mdates  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
@@ -359,6 +361,96 @@ def _plot_comm(run_dir, raw, meta, addresses, types, tag) -> Path:
     fig.savefig(out, dpi=130)
     plt.close(fig)
     return out
+
+
+def range_figure(rows: list[dict], resolution: str, logbook: list[dict], footer: str, simulated: bool,
+                 start_ms: int | None = None, end_ms: int | None = None) -> bytes:
+    """PNG a pedido para un intervalo (registros ya anotados). No se guarda en disco.
+
+    Paneles: onda corta (GHI y DHI), onda larga (Ld↓ y neta + σT⁴) y, si hay, la DNI
+    estimada. Cruces rojas: valores con alguna prueba de QC fallida. Líneas
+    verticales: notas de la bitácora.
+    """
+    import io
+    from datetime import datetime
+
+    def local(t_ms: int) -> datetime:
+        return datetime.fromtimestamp(t_ms / 1000)  # hora local del PC, con su horario de verano
+
+    value_key = "mean_wm2" if resolution == "1min" else "measurement"
+    time_key = "minute_ms" if resolution == "1min" else "t_ms"
+    offset_ms = 30_000 if resolution == "1min" else 0
+    frame = pd.DataFrame([{
+        "t": local(r[time_key] + offset_ms),
+        "address": r["address"], "label": r.get("label") or f"#{r['address']}", "role": r["role"],
+        "value": r[value_key] if (r["valid"] if resolution != "1min" else r["n_valid"] > 0) else None,
+        "calc": r.get("lw_down_calc") if resolution != "1min" else None,
+        "dni": r.get("dni_est_wm2"), "fail": r["qc"]["summary"] in ("bad", "suspect"),
+    } for r in rows]) if rows else pd.DataFrame(columns=["t", "address", "label", "role", "value", "calc", "dni", "fail"])
+    shortwave = frame[frame["role"].isin(["GHI", "DHI", "SHADE_OFF"])]
+    longwave = frame[frame["role"] == "LWD"]
+    has_dni = frame["dni"].notna().any()
+    panels = 1 + (not longwave.empty) + bool(has_dni)
+    fig, axes = plt.subplots(panels, 1, figsize=(12, 3.4 * panels + 0.8), sharex=True, layout="constrained", squeeze=False)
+    axes = list(axes[:, 0])
+    tag = "  [DATOS SIMULADOS]" if simulated else ""
+    fig.suptitle(f"Radiometría — {'promedios de 1 min' if resolution == '1min' else 'muestras de 1 s'}{tag}",
+                 x=0.01, ha="left", fontsize=13, fontweight="bold", color=INK)
+    addresses = sorted(int(a) for a in frame["address"].unique()) if not frame.empty else []
+    marker = "." if len(frame) < 300 else None
+    ax = axes[0]
+    for (address, role), g in shortwave.groupby(["address", "role"]):
+        name = {"GHI": "global", "DHI": "difusa", "SHADE_OFF": "sombra no garantizada"}.get(role, role)
+        ax.plot(g["t"], g["value"], lw=1.2, marker=marker, color=sensor_color(int(address), addresses),
+                label=f"{g['label'].iloc[0]} · {name}")
+        bad = g[g["fail"] & g["value"].notna()]
+        if not bad.empty:
+            ax.plot(bad["t"], bad["value"], "x", color=CRITICAL, ms=4)
+    ax.set_title("Onda corta (sin corrección adicional)")
+    ax.set_ylabel("W/m²")
+    panel = 1
+    if not longwave.empty:
+        ax2 = axes[panel]
+        panel += 1
+        for address, g in longwave.groupby("address"):
+            color = sensor_color(int(address), addresses)
+            ax2.plot(g["t"], g["value"], lw=1.2, marker=marker, color=color, label=f"{g['label'].iloc[0]} · Ld↓")
+            if g["calc"].notna().any():
+                ax2.plot(g["t"], g["calc"], lw=1, ls="--", color=MUTED, label="neta + σT⁴ (comprobación)")
+        ax2.set_title("Onda larga descendente")
+        ax2.set_ylabel("W/m²")
+    if has_dni:
+        ax3 = axes[panel]
+        d = frame[frame["role"] == "DHI"]  # incluye NaN para cortar la línea fuera de condiciones
+        ax3.plot(d["t"], pd.to_numeric(d["dni"]), lw=1.2, marker=marker, color="#7966a8",
+                 label="DNI estimada (GHI − DHI)/cos z")
+        ax3.set_title("DNI estimada — derivada, no medida")
+        ax3.set_ylabel("W/m²")
+    if (frame["fail"] & frame["value"].notna()).any():
+        axes[0].plot([], [], "x", color=CRITICAL, label="QC con falla")
+    notes: dict[int, list[str]] = {}
+    for entry in logbook:
+        if not entry.get("voided"):
+            notes.setdefault(entry["t_ms"] // 60_000, []).append(entry["category_label"])
+    for minute, labels in sorted(notes.items()):
+        t = local(minute * 60_000)
+        for a in axes:
+            a.axvline(t, color=AXIS, lw=1, ls=":")
+        axes[0].annotate(" · ".join(dict.fromkeys(labels)), xy=(t, 1), xycoords=("data", "axes fraction"),
+                         fontsize=8, color=INK_2, rotation=90, va="top", ha="right")
+    for a in axes:
+        if a.get_legend_handles_labels()[0]:
+            a.legend(loc="upper left", fontsize=8, ncols=3)
+        _format_time_axis(a)
+        if start_ms is not None and end_ms is not None:
+            a.set_xlim(local(start_ms), local(end_ms))
+    if frame.empty:
+        axes[0].text(0.5, 0.5, "Sin datos en el intervalo", transform=axes[0].transAxes, ha="center", color=MUTED)
+    fig.supxlabel(footer, fontsize=7.5, color=MUTED, x=0.01, ha="left")
+    out = io.BytesIO()
+    fig.savefig(out, format="png", dpi=120)
+    plt.close(fig)
+    return out.getvalue()
 
 
 def plot_run(path: Path) -> list[Path]:

@@ -10,7 +10,8 @@ from unittest import mock
 
 from smp22x import acquisition
 from smp22x import registers as reg
-from smp22x.acquisition import Acquisition, AcquisitionConfig, _MinuteAggregator
+from smp22x.acquisition import Acquisition, AcquisitionConfig
+from smp22x.minutes import MinuteAggregator
 from smp22x.cli import _open_bus, build_parser, cmd_scan, parse_duration, sensor_types
 from smp22x.sensor import (
     LW_CHECK_TOLERANCE_WM2,
@@ -216,17 +217,19 @@ class PyrgeometerTests(unittest.TestCase):
         self.assertLess(abs(s.lw_down - s.lw_down_calc), 1.0)
 
 
+def _aggregate(samples) -> list[list[str]]:
+    agg = MinuteAggregator(interval_s=1.0)
+    records = [m for s in samples for m in agg.add(s)] + agg.flush()
+    out = io.StringIO()
+    csv.writer(out).writerows(m.csv_row() for m in records)
+    return list(csv.reader(io.StringIO(out.getvalue())))
+
+
 class MinuteAggregatorTests(unittest.TestCase):
     def test_minute_rollover(self):
-        out = io.StringIO()
-        agg = _MinuteAggregator(csv.writer(out), interval_s=1.0)
         t0 = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
-        for i in range(61):
-            s = Sample(3, t0 + timedelta(seconds=i), ok=True, mode=1, status=0,
-                       irradiance=100.0 + (i % 2), body_temp_c=25.0)
-            agg.add(s)
-        agg.flush()
-        rows = list(csv.reader(io.StringIO(out.getvalue())))
+        rows = _aggregate(Sample(3, t0 + timedelta(seconds=i), ok=True, mode=1, status=0,
+                                 irradiance=100.0 + (i % 2), body_temp_c=25.0) for i in range(61))
         self.assertEqual(len(rows), 2)
         first = dict(zip(acquisition.MINUTE_COLUMNS, rows[0]))
         self.assertEqual(first["sensor_type"], reg.PYRANOMETER)
@@ -237,15 +240,11 @@ class MinuteAggregatorTests(unittest.TestCase):
         self.assertEqual(dict(zip(acquisition.MINUTE_COLUMNS, rows[1]))["complete"], "0")
 
     def test_pyrgeometer_averages_lw_down(self):
-        out = io.StringIO()
-        agg = _MinuteAggregator(csv.writer(out), interval_s=1.0)
         t0 = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
-        for i in range(60):
-            s = Sample(2, t0 + timedelta(seconds=i), ok=True, sensor_type=reg.PYRGEOMETER,
-                       mode=1, status=0, irradiance=-130.0, lw_down=320.0, body_temp_c=25.0)
-            agg.add(s)
-        agg.flush()
-        row = dict(zip(acquisition.MINUTE_COLUMNS, next(csv.reader(io.StringIO(out.getvalue())))))
+        rows = _aggregate(Sample(2, t0 + timedelta(seconds=i), ok=True, sensor_type=reg.PYRGEOMETER,
+                                 mode=1, status=0, irradiance=-130.0, lw_down=320.0, body_temp_c=25.0)
+                          for i in range(60))
+        row = dict(zip(acquisition.MINUTE_COLUMNS, rows[0]))
         self.assertEqual(row["sensor_type"], reg.PYRGEOMETER)
         self.assertEqual(row["mean_wm2"], "320.00")
         self.assertEqual(row["net_mean_wm2"], "-130.00")

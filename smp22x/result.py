@@ -4,7 +4,8 @@ from typing import Generic, Literal, TypeVar
 
 T = TypeVar("T")
 ErrorCode = Literal["database_unavailable", "database_busy", "schema_mismatch",
-                    "writer_active", "run_not_found", "invalid_input", "storage_failure"]
+                    "writer_active", "run_not_found", "invalid_input", "storage_failure",
+                    "not_found", "forbidden", "archive_failure", "migration_failure"]
 
 
 @dataclass(frozen=True)

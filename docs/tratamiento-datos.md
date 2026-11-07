@@ -16,9 +16,16 @@ de calibración, compensación térmica, filtro, normalización solar o ajuste e
 | Sensor SGR | Se conserva registro 5 neto y registro 10 Ld↓ | Magnitud principal Ld↓; neta aparte. No sumar σT⁴ otra vez al registro 10 |
 | Calidad | Respuesta, modo, presencia de magnitud y máscara de flags | `valid`, `ok`, `error_code` y error; no se borra la muestra inválida |
 | Consistencia SGR | `neta + 5,67·10⁻⁸·(T_°C+273,15)⁴` | `lw_down_calc` y `lw_check_delta`; nunca reemplazan Ld↓ leído |
-| Comparación SMP | `E3−E4`; porcentaje `100·(E3−E4)/((E3+E4)/2)` | Solo pareja válida del mismo ciclo; % ausente si media ≤100 W/m² |
-| Promedio de minuto | Media, mínimo/máximo, desviación poblacional sobre válidas | Irradiancia SMP o Ld↓ SGR; números y cobertura acompañan al resultado |
+| Rol | Tipo de sensor + bola de sombra + SOLYS2 vigentes en el instante de la lectura | `GHI`, `DHI`, `LWD` o `SHADE_OFF`; el valor no cambia |
+| Comparación | Entre instrumentos del **mismo rol**: `Ea−Eb`; porcentaje `100·(Ea−Eb)/((Ea+Eb)/2)` | Solo pareja válida del mismo ciclo; % ausente si media ≤100 W/m²; nunca global contra difusa |
+| Posición solar | NOAA/Meeus con refracción; `Sa = 1361/R²`; `μ0 = max(cos z, 0)` | `solar_zenith_deg`, `kt`; requiere sitio configurado |
+| QC | Límites BSRN, cociente difusa/global, sombreado y comparación (proyecto) | `ok`/`fail`/`na` por prueba y resumen; el valor medido no se toca |
+| DNI estimada | `(GHI − DHI)/cos z` con z < 80°, SOLYS2 en uso, ambos válidos | `dni_est_wm2`, etiquetada como derivada; no es medición |
+| Promedio de minuto | Media, mínimo/máximo, desviación poblacional sobre válidas | Irradiancia SMP o Ld↓ SGR; números y cobertura acompañan al resultado; QC aplicado a la media |
 | Presentación | Redondeo para tabla/CSV, gráfica y conversión de UTC a hora local | La BD conserva flotantes antes del redondeo de presentación |
+
+Las pruebas y sus fuentes se explican para físicos en
+[calidad de datos](fisicos/03-calidad-de-datos.md).
 
 La fórmula SGR procede de [manual SGR §7.1.5 p. 17](../references/pyrgeometer-SGR4/Operational_Manual_CGR4_SGR4_V10.pdf#page=17).
 Las escalas proceden de [SMP §15.6 pp. 48–49](../references/pyranometer-SMP22x/Operational_Manual_SMP10x_SMP22x_Smart_Pyranometers_V20.pdf#page=48).

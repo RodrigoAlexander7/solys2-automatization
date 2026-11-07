@@ -9,22 +9,21 @@ comandos; [C4](arquitectura-c4.md) describe los componentes actuales; el
 
 | Área | Implementación |
 |---|---|
-| Persistencia | SQLite por ciclo, esquema versionado, lock de escritor, valores físicos y palabras originales |
-| Consulta | API de solo lectura, filtros UTC, límites, cursor, últimas muestras y agregados por minuto |
-| Vivo | SSE con IDs después de commit y reconexión; histórico inicial acotado |
-| Frontend | Selección de corrida, tabla de calidad/edad y seis gráficas SVG locales |
-| Gráficas | Onda corta, Ld↓ y comprobación, diferencia relativa, temperatura, RTT y alimentación |
-| Calidad | Lecturas inválidas/fallidas conservadas; datos obsoletos visibles; huecos sin interpolar |
+| Persistencia | Esquema 2 tipado (~217 B/fila), minutos y eventos en la misma transacción del ciclo, migración verificada desde el esquema 1 |
+| Archivo | Parquet diario verificado (filas y SHA-256), retención de 30 días para 1 s, minutos y eventos siempre |
+| Consulta | Por corrida y por fecha entre corridas; base activa + Parquet sin duplicar |
+| Vivo | SSE con IDs después de commit y reconexión; monitor limitado al último minuto |
+| Observatorio | Configuración versionada (sitio, SOLYS2, bola de sombra, umbrales) y bitácora de solo agregar, en base aparte escrita por la web |
+| Calidad | Validez del sensor, QC BSRN, sombreado y comparación entre iguales; DNI estimada; nunca modifican valores |
+| Tiempo | Comprobación SNTP del reloj con eventos y avisos; sin ajustar el reloj |
+| Frontend | Monitor del último minuto, histórico (series reducidas, carpet plot y descargas), instrumentos, bitácora con línea de tiempo y documentación para físicos |
+| Interfaz liviana | Ventana Tkinter sin navegador: último minuto, últimos valores y CSV clásico (~30 MB de RAM) |
+| Terminal | Una línea legible por ciclo o resumen cada N s; trazas JSON en `data/logs/` |
+| Gráficas | uPlot con cursor sincronizado, zoom, marcas de QC y bitácora, PNG por gráfico; figuras matplotlib a pedido |
+| Seguridad | Host local obligatorio, escrituras con Origin propio y JSON, negativa a escuchar en red sin autenticación |
 | Diagnóstico | Result en fronteras, códigos explícitos, trazas JSON anidadas y trace_id en API |
-| Operación | .env.example, Make nativo/Docker, Compose simulado y variante Linux serie |
-| Análisis | CSV/PNG anteriores y exportación desde SQLite; backup consistente en vivo |
-
-La implementación utiliza SVG con buffer acotado en lugar de añadir uPlot.
-Los promedios se consultan por API y se conservan en CSV; la gráfica viva de esta
-versión muestra muestras, sin superponer puntos de promedio de minuto. La UI
-consulta el tramo reciente de cada corrida; intervalos históricos arbitrarios
-se recuperan por API/exportación. Se documentan esos límites para no presentar
-una función planeada como ya entregada.
+| Operación | .env.example, Make nativo/Docker, Compose simulado y variante Linux serie, `migrate` y `archive` |
+| Tests | Por niveles, incluidos escenarios de falla simulados, rendimiento y hardware opcional |
 
 ## Decisiones operativas
 
@@ -50,12 +49,15 @@ No se migra solo porque los datos sean temporales.
   observados. La fórmula de consistencia no certifica el mapa completo.
 - Ejecutar una prueba sostenida en la mini-PC Windows: CPU, RAM, disco, latencia
   de commit, refresco visual y ciclos perdidos frente a la adquisición sola.
-- Justificar umbrales de alertas según la investigación. Las referencias de
-  2 %, ±5 W/m² y 10 V no son límites universales del fabricante.
-- Anotaciones y controles desde la web quedan fuera de la interfaz de lectura;
-  requerirían una nueva especificación de escrituras y su coordinación.
-- Añadir navegación temporal más amplia o promedios visuales si el uso real lo
-  necesita; evitar cargar todo el histórico en el navegador.
+- Validar con mediciones reales los umbrales del proyecto (sombreado kt > 0,6 y
+  DHI/GHI > 0,8; comparación 5 %). No son límites del fabricante. El de reloj
+  (1 s) sigue el manual de operaciones BSRN V2.1 §2.3.1.
+- Integrar el SOLYS2 por RS-485 o Ethernet con su protocolo de comandos
+  (manual en `references/solys2-sun-traker/`, anexos A–D): posición, hora GPS y
+  estado de seguimiento. Luego el pirheliómetro con el test de cierre de BSRN
+  (§9.3.2.1: 2 % o 15 W/m²) y, si corresponde, el ceilómetro.
+- Agregar autenticación antes de abrir el dashboard a la red del laboratorio.
+- Cambiar direcciones Modbus sigue fuera de la web (SmartExplorer).
 
 La evidencia realizada y lo pendiente se mantienen en [SDD/tasks](sdd/tasks.md).
 Fuentes de diseño: [SQLite WAL](https://sqlite.org/wal.html),

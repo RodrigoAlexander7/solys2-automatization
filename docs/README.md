@@ -3,14 +3,16 @@
 | Orden | Documento | Para qué leerlo |
 |---|---|---|
 | 1 | [README del proyecto](../README.md) | Montaje, instalación, comandos y archivos actuales |
-| 2 | [Lectura de registros](lectura-registros.md) | Direcciones, signo, escalas, unidades y páginas de los manuales de ambos sensores |
-| 3 | [Arquitectura C4 actual](arquitectura-c4.md) | Componentes y recorrido de una lectura |
-| 4 | [Decisiones técnicas](decisiones-tecnicas.md) | Justificación y limitaciones del código |
-| 5 | [Prueba 01](prueba-01.md) | Evidencia del montaje y comprobaciones pendientes |
-| 6 | [Tratamiento de datos](tratamiento-datos.md) | Qué se convierte, conserva y calcula; ecuaciones y límites |
-| 7 | [Operación del dashboard](operacion-dashboard.md) | Arranque nativo/Docker, Windows, .env, API, backup y tests |
-| 8 | [Plan del dashboard](plan-dashboard.md) | Estado de implementación y próximos pasos |
-| 9 | [SDD: especificación](sdd/spec.md), [diseño](sdd/design.md), [evidencia](sdd/tasks.md) | Requisitos, casos límite y cobertura verificable |
+| 2 | [Documentación para físicos](fisicos/01-inicio.md) | Uso del dashboard, magnitudes, calidad, SOLYS2, reloj, mantenimiento, datos y estado de validación (también dentro del dashboard) |
+| 3 | [Lectura de registros](lectura-registros.md) | Direcciones, signo, escalas, unidades y páginas de los manuales de ambos sensores |
+| 4 | [Arquitectura C4 actual](arquitectura-c4.md) | Componentes, almacenes y recorrido de una lectura |
+| 5 | [Decisiones técnicas](decisiones-tecnicas.md) | Justificación y limitaciones del código (D1–D23) |
+| 6 | [Prueba 01](prueba-01.md) | Evidencia del montaje y comprobaciones pendientes |
+| 7 | [Tratamiento de datos](tratamiento-datos.md) | Qué se convierte, conserva y calcula; ecuaciones y límites |
+| 8 | [Operación del dashboard](operacion-dashboard.md) | Arranque nativo/Docker, Windows, .env, migración, archivo, API, backup y tests |
+| 9 | [Plan del dashboard](plan-dashboard.md) | Estado de implementación y próximos pasos |
+| 10 | [Propuestas de funcionalidades](propuestas-funcionalidades.md) | Ideas evaluadas contra código y manuales; decisiones tomadas |
+| 11 | [SDD: especificación](sdd/spec.md), [diseño](sdd/design.md), [evidencia](sdd/tasks.md) | Requisitos, casos límite y cobertura verificable |
 
 Los PDF originales están en [references/](../references/). Para SMP V20 y SGR
 V10, las páginas citadas cuentan desde 1 y coinciden con la numeración impresa.

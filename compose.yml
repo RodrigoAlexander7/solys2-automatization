@@ -11,8 +11,12 @@ services:
         required: false
     environment:
       SMP_DB_PATH: /app/data/acquisition.sqlite3
+      SMP_OBSERVATORY_DB: /app/data/observatory.sqlite3
+      SMP_ARCHIVE_DIR: /app/data/archive
       SMP_API_HOST: 0.0.0.0
       SMP_API_PORT: 8050
+      # Escucha en 0.0.0.0 solo dentro del contenedor; el puerto se publica en 127.0.0.1.
+      SMP_CONTAINER_LOOPBACK: "1"
       SMP_FRONTEND_DIR: /app/frontend/build
       HOME: /tmp
     ports:
@@ -38,6 +42,7 @@ services:
     environment:
       SMP_DB_PATH: /app/data/acquisition.sqlite3
       SMP_OUT_DIR: /app/data
+      SMP_ARCHIVE_DIR: /app/data/archive
       HOME: /tmp
     volumes:
       - "${SMP_DATA_DIR:-./data}:/app/data"

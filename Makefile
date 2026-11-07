@@ -6,7 +6,7 @@ else
 VENV_PYTHON := .venv/bin/python
 endif
 
-.PHONY: help env install frontend check test build acquire web run docker-build docker-up docker-web docker-down docker-logs docker-test
+.PHONY: help env install frontend check test test-e2e test-perf test-hardware build acquire web run ventana run-ligero migrate archive docker-build docker-up docker-web docker-down docker-logs docker-test
 help:
 	@$(PYTHON) scripts/manage.py help
 env:
@@ -22,6 +22,20 @@ check:
 test:
 	$(VENV_PYTHON) -m unittest discover -s tests
 	$(BUN) run --cwd frontend test
+test-e2e: build
+	$(BUN) run --cwd frontend test:e2e
+test-perf:
+	SMP_PERF=1 $(VENV_PYTHON) -m unittest discover -s tests -p test_performance.py
+test-hardware:
+	SMP_HARDWARE=1 $(VENV_PYTHON) -m unittest discover -s tests -p test_hardware.py
+ventana:
+	$(VENV_PYTHON) -m smp22x ventana
+run-ligero:
+	$(VENV_PYTHON) scripts/manage.py run-ligero
+migrate:
+	$(VENV_PYTHON) -m smp22x migrate
+archive:
+	$(VENV_PYTHON) -m smp22x archive
 build:
 	$(BUN) run --cwd frontend build
 acquire:
